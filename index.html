@@ -291,6 +291,265 @@ const localStore = (() => {
   };
 })();
 
+// ---- Tax invoice (created when a sale includes an online payment) ----
+const GST_NO = '24ACRPK1406H2ZR';
+const INVOICE_HSN = '5810';
+const INVOICE_METERS_PER_SUIT = 7.5;
+const INVOICE_GST_RATE = 5; // percent, already included in the sale amount
+
+function round2(n) { return Math.round((Number(n) + Number.EPSILON) * 100) / 100; }
+function fmt2(n) { return Number(n).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 }); }
+
+function invoiceFinancialYear(date) {
+  const d = new Date(date);
+  const y = d.getFullYear();
+  const start = d.getMonth() >= 3 ? y : y - 1; // financial year runs April to March
+  return `${String(start).slice(2)}-${String(start + 1).slice(2)}`;
+}
+function nextInvoiceSeq(sales) {
+  return sales.reduce((m, x) => Math.max(m, (x.invoice && x.invoice.seq) || 0), 0) + 1;
+}
+function makeInvoiceMeta(seq, date, name, mobile) {
+  return { seq, no: `AC/${invoiceFinancialYear(date)}/${String(seq).padStart(4, '0')}`, customerName: name, customerMobile: mobile };
+}
+
+function numberToWordsIN(num) {
+  const ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];
+  const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
+  const two = (n) => (n < 20 ? ones[n] : tens[Math.floor(n / 10)] + (n % 10 ? ' ' + ones[n % 10] : ''));
+  const three = (n) => (n >= 100 ? ones[Math.floor(n / 100)] + ' Hundred' + (n % 100 ? ' ' + two(n % 100) : '') : two(n));
+  function words(n) {
+    if (n === 0) return 'Zero';
+    const parts = [];
+    const crore = Math.floor(n / 10000000); n %= 10000000;
+    const lakh = Math.floor(n / 100000); n %= 100000;
+    const thousand = Math.floor(n / 1000); n %= 1000;
+    if (crore) parts.push(three(crore) + ' Crore');
+    if (lakh) parts.push(three(lakh) + ' Lakh');
+    if (thousand) parts.push(three(thousand) + ' Thousand');
+    if (n) parts.push(three(n));
+    return parts.join(' ');
+  }
+  const total = round2(num);
+  const rupees = Math.floor(total);
+  const paise = Math.round((total - rupees) * 100);
+  return `Rupees ${words(rupees)}${paise ? ' and ' + words(paise) + ' Paise' : ''} Only`;
+}
+
+// Works out every invoice figure from the sale lines of one bill.
+function buildInvoiceData(items) {
+  const meta = (items.find((x) => x.invoice) || {}).invoice || {};
+  const total = items.reduce((sum, x) => sum + Number(x.total || 0), 0); // after any bargaining
+  const suits = items.reduce((sum, x) => sum + Number(x.qty || 0), 0);
+  const meters = round2(suits * INVOICE_METERS_PER_SUIT);
+  const taxable = round2(total / (1 + INVOICE_GST_RATE / 100));
+  const gst = round2(total - taxable);
+  return {
+    no: meta.no || '',
+    date: items[0].timestamp,
+    name: meta.customerName || '',
+    mobile: meta.customerMobile || '',
+    suits,
+    meters,
+    rate: meters > 0 ? taxable / meters : 0,
+    taxable,
+    gst,
+    total,
+    split: aggregateBillSplit(items),
+  };
+}
+
+function loadImage(src) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => resolve(null);
+    img.src = src;
+  });
+}
+
+// Draws the invoice on an A4 page (1240 x 1754 px = 150 dpi).
+async function drawInvoiceCanvas(d) {
+  const W = 1240;
+  const H = 1754;
+  const M = 70;
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textBaseline = 'alphabetic';
+  const ink = '#2B241E';
+  const soft = '#6B5F55';
+  const line = '#D9CFC4';
+  const text = (str, x, y, size, opts = {}) => {
+    ctx.font = `${opts.bold ? '700' : '400'} ${size}px sans-serif`;
+    ctx.fillStyle = opts.color || ink;
+    ctx.textAlign = opts.align || 'left';
+    ctx.fillText(str, x, y);
+  };
+  const rule = (y, color = line, w = 2) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = w;
+    ctx.beginPath();
+    ctx.moveTo(M, y);
+    ctx.lineTo(W - M, y);
+    ctx.stroke();
+  };
+
+  // Header: logo on the left, invoice title and GST number on the right
+  const logo = await loadImage(LOGO_DATA_URI);
+  if (logo) {
+    const lh = 120;
+    ctx.drawImage(logo, M, 55, (logo.width / logo.height) * lh, lh);
+  }
+  text('TAX INVOICE', W - M, 105, 46, { bold: true, align: 'right', color: COLORS.primary });
+  text(`GSTIN: ${GST_NO}`, W - M, 150, 28, { align: 'right' });
+  text('Surat, Gujarat', W - M, 188, 26, { align: 'right', color: soft });
+  rule(235, COLORS.primary, 4);
+
+  // Bill-to and invoice details
+  text('BILLED TO', M, 292, 22, { bold: true, color: soft });
+  text(d.name, M, 336, 34, { bold: true });
+  text(`Mobile: ${d.mobile}`, M, 378, 28);
+  const dateStr = new Date(d.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' });
+  text('INVOICE NO.', W - M - 330, 292, 22, { bold: true, color: soft });
+  text(d.no, W - M - 330, 336, 32, { bold: true });
+  text('DATE', W - M - 330, 392, 22, { bold: true, color: soft });
+  text(dateStr, W - M - 330, 436, 30);
+
+  // Item table
+  const top = 500;
+  ctx.fillStyle = '#F6ECF1';
+  ctx.fillRect(M, top, W - 2 * M, 70);
+  const cx = { no: M + 15, desc: M + 80, hsn: 560, qty: 700, rate: 1000, amt: W - M - 15 };
+  text('#', cx.no, top + 45, 25, { bold: true });
+  text('Item', cx.desc, top + 45, 25, { bold: true });
+  text('HSN', cx.hsn, top + 45, 25, { bold: true });
+  text('Qty (m)', cx.qty, top + 45, 25, { bold: true });
+  text('Rate / m', cx.rate, top + 45, 25, { bold: true, align: 'right' });
+  text('Amount', cx.amt, top + 45, 25, { bold: true, align: 'right' });
+  const ry = top + 130;
+  text('1', cx.no, ry, 28);
+  text('Fabrics', cx.desc, ry, 30, { bold: true });
+  text(INVOICE_HSN, cx.hsn, ry, 28);
+  text(String(d.meters), cx.qty, ry, 28);
+  text(fmt2(d.rate), cx.rate, ry, 28, { align: 'right' });
+  text(fmt2(d.taxable), cx.amt, ry, 28, { align: 'right' });
+  text(`${d.suits} suit${d.suits === 1 ? '' : 's'} × ${INVOICE_METERS_PER_SUIT} m`, cx.desc, ry + 36, 22, { color: soft });
+  rule(ry + 70);
+
+  // Totals
+  let y = ry + 140;
+  const labelX = 700;
+  const row = (label, value, bold) => {
+    text(label, labelX, y, bold ? 32 : 28, { bold });
+    text(value, W - M - 15, y, bold ? 32 : 28, { bold, align: 'right' });
+    y += 54;
+  };
+  row('Taxable value', `₹ ${fmt2(d.taxable)}`);
+  row(`GST @ ${INVOICE_GST_RATE}% (included)`, `₹ ${fmt2(d.gst)}`);
+  rule(y - 30, ink, 3);
+  y += 10;
+  row('Total', `₹ ${fmt2(d.total)}`, true);
+
+  y += 20;
+  text('Amount in words', M, y, 22, { bold: true, color: soft });
+  y += 42;
+  // wrap the words onto at most two lines
+  const words = numberToWordsIN(d.total).split(' ');
+  ctx.font = '400 28px sans-serif';
+  let lineStr = '';
+  const lines = [];
+  for (const w of words) {
+    const t = lineStr ? lineStr + ' ' + w : w;
+    if (lineStr && ctx.measureText(t).width > W - 2 * M) { lines.push(lineStr); lineStr = w; } else lineStr = t;
+  }
+  if (lineStr) lines.push(lineStr);
+  lines.forEach((l, i) => text(l, M, y + i * 40, 28));
+  y += lines.length * 40 + 30;
+
+  const payText = paymentSplitText(d.split);
+  if (payText) {
+    text('Payment', M, y, 22, { bold: true, color: soft });
+    text(payText, M, y + 42, 28);
+  }
+
+  // Footer
+  rule(H - 200);
+  text('Thank you for shopping with Aaraa Creation!', W / 2, H - 140, 30, { bold: true, align: 'center', color: COLORS.primary });
+  text('This is a computer-generated invoice.', W / 2, H - 95, 24, { align: 'center', color: soft });
+  return canvas;
+}
+
+// One-page PDF around a JPEG image.
+function buildSinglePagePdf(jpeg, imgW, imgH, pageW, pageH) {
+  const enc = new TextEncoder();
+  const chunks = [];
+  const offsets = [];
+  let offset = 0;
+  const push = (d) => {
+    const u = typeof d === 'string' ? enc.encode(d) : d;
+    chunks.push(u);
+    offset += u.length;
+  };
+  push('%PDF-1.4\n');
+  offsets[1] = offset;
+  push('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+  offsets[2] = offset;
+  push('2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n');
+  offsets[3] = offset;
+  push(`3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pageW} ${pageH}] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>\nendobj\n`);
+  const content = `q ${pageW} 0 0 ${pageH} 0 0 cm /Im0 Do Q`;
+  offsets[4] = offset;
+  push(`4 0 obj\n<< /Length ${content.length} >>\nstream\n${content}\nendstream\nendobj\n`);
+  offsets[5] = offset;
+  push(`5 0 obj\n<< /Type /XObject /Subtype /Image /Width ${imgW} /Height ${imgH} /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ${jpeg.length} >>\nstream\n`);
+  push(jpeg);
+  push('\nendstream\nendobj\n');
+  const xrefPos = offset;
+  let xref = 'xref\n0 6\n0000000000 65535 f \n';
+  for (let k = 1; k <= 5; k++) xref += `${String(offsets[k]).padStart(10, '0')} 00000 n \n`;
+  push(xref);
+  push(`trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF`);
+  return new Blob(chunks, { type: 'application/pdf' });
+}
+
+// Shares the invoice PDF (WhatsApp etc. via the phone's share sheet), else saves it.
+async function shareInvoicePdf(d, canvas) {
+  const jpeg = await canvasToJpegBytes(canvas);
+  const blob = buildSinglePagePdf(jpeg, canvas.width, canvas.height, 595.28, 841.89);
+  const filename = `Invoice-${(d.no || 'Aaraa').replace(/[^A-Za-z0-9-]/g, '-')}.pdf`;
+  try {
+    const file = new File([blob], filename, { type: 'application/pdf' });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: `Invoice ${d.no}` });
+      return 'shared';
+    }
+  } catch (e) {
+    if (e && e.name === 'AbortError') return 'cancelled';
+  }
+  const downloads = await getClaudeCap('downloads');
+  if (downloads) {
+    try {
+      await downloads.save({ filename, data: blob });
+      return 'saved';
+    } catch (e) {
+      if (e && e.code === 'declined') return 'cancelled';
+    }
+  }
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+  return 'saved';
+}
+
 // Handwork options shown as tap-chips in the suit form and printed on the label.
 const HANDWORK_PARTS = ['Front', 'Back', 'Neck', 'Daaman', 'Sleeves', 'Bottom', 'Dupatta'];
 const HANDWORK_BUNCH = ['1 Bunch', '2 Bunch'];
@@ -532,6 +791,9 @@ function AaraaPOS() {
   const [saleInProgress, setSaleInProgress] = useState(false);
   const [saleNote, setSaleNote] = useState('');
   const [payCash, setPayCash] = useState('');
+  const [custName, setCustName] = useState('');
+  const [custMobile, setCustMobile] = useState('');
+  const [invoiceItems, setInvoiceItems] = useState(null); // sale lines of the bill whose invoice is open
   const [finalOverride, setFinalOverride] = useState(''); // bargained final amount for the bill (empty = no change)
   const [payOnline, setPayOnline] = useState('');
   const [payDue, setPayDue] = useState('');
@@ -644,6 +906,20 @@ function AaraaPOS() {
     let lastChar = '';
     let runLen = 0; // how many times in a row the same character has arrived at key-repeat speed
     let stuck = false;
+    // Keys currently held (key-down seen, key-up not yet). A key-down for a key that is still
+    // held is the keyboard auto-repeating, not a new character — but only trust this once this
+    // scanner has shown it sends key-up events (otherwise identical digits would be dropped).
+    const held = new Map();
+    let keyUpSeen = false;
+    function onKeyUp(e) {
+      if (e.key.length !== 1) return;
+      if (diagOnRef.current) {
+        const t = Date.now();
+        setDiagLog((prev) => [...prev, `^${e.key}+${lastEvt ? t - lastEvt : 0}`].slice(-80));
+        lastEvt = t;
+      }
+      if (e.keyCode !== 229) { keyUpSeen = true; held.delete(e.key); }
+    }
     function onKey(e) {
       if (e.ctrlKey || e.metaKey || e.altKey) return;
       const el = document.activeElement;
@@ -661,6 +937,9 @@ function AaraaPOS() {
       const hardwareChar = e.key.length === 1 && e.keyCode !== 229 && !e.isComposing;
       if (hardwareChar) {
         e.preventDefault();
+        if (gap > 400) held.clear();
+        if (keyUpSeen && held.has(e.key)) return; // auto-repeat of a key that was never released
+        held.set(e.key, now);
         if (gap < 120 && now - (onKey.lastSet || 0) > 1000) { onKey.lastSet = now; setLastScanAt(now); }
         if (stuck) {
           // Ignore the flood until the keyboard has been quiet for a moment.
@@ -685,7 +964,11 @@ function AaraaPOS() {
       }
     }
     window.addEventListener('keydown', onKey, true);
-    return () => window.removeEventListener('keydown', onKey, true);
+    window.addEventListener('keyup', onKeyUp, true);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      window.removeEventListener('keyup', onKeyUp, true);
+    };
   }, [tab, sellModalOpen]);
 
   useEffect(() => {
@@ -902,6 +1185,9 @@ function AaraaPOS() {
   // A changed cart (item added/removed, price or quantity edited) invalidates a bargained total.
   useEffect(() => { setFinalOverride(''); }, [cartSubtotal]);
   const paymentAssigned = (Number(payCash) || 0) + (Number(payOnline) || 0) + (Number(payDue) || 0);
+  const needsInvoice = (Number(payOnline) || 0) > 0; // an online payment needs a tax invoice
+  const custMobileClean = custMobile.replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
+  const invoiceMissing = needsInvoice && (!custName.trim() || custMobileClean.length !== 10);
 
   function holdCurrentCart() {
     if (cart.length === 0) return;
@@ -912,6 +1198,8 @@ function AaraaPOS() {
     ]);
     setCart([]);
     setFinalOverride('');
+    setCustName('');
+    setCustMobile('');
     setSaleNote('');
     setPayCash('');
     setPayOnline('');
@@ -935,6 +1223,8 @@ function AaraaPOS() {
     }
     setCart(held.cart);
     setFinalOverride('');
+    setCustName('');
+    setCustMobile('');
     setSaleNote(held.note);
     setPayCash(held.payCash);
     setPayOnline(held.payOnline);
@@ -959,6 +1249,10 @@ function AaraaPOS() {
     }
     if ((Number(payDue) || 0) > 0 && !saleNote.trim()) {
       setScanError('Add the customer\'s name and phone number in the Note field before completing a sale with a due amount');
+      return;
+    }
+    if (invoiceMissing) {
+      setScanError('Online payment needs an invoice — enter the customer\'s name and a 10-digit mobile number');
       return;
     }
     setSaleInProgress(true);
@@ -996,6 +1290,7 @@ function AaraaPOS() {
     // With a bargained total, spread the final amount over the items by their share of the list
     // total (the last item takes the rounding remainder) so line totals add up to the bill exactly.
     let totalLeft = cartTotal;
+    const invoiceMeta = needsInvoice ? makeInvoiceMeta(nextInvoiceSeq(sales), now, custName.trim(), custMobileClean) : undefined;
     const newSales = cart.map((c, idx) => {
       const listTotal = c.price * c.qty;
       const isLast = idx === cart.length - 1;
@@ -1022,6 +1317,7 @@ function AaraaPOS() {
         timestamp: now,
         note: note || null,
         paymentSplit: { cash: lineCash, online: lineOnline, due: lineDue },
+        invoice: invoiceMeta,
       };
     });
     const recordedTotal = cartTotal;
@@ -1044,8 +1340,11 @@ function AaraaPOS() {
     setPayCash('');
     setPayOnline('');
     setPayDue('');
+    setCustName('');
+    setCustMobile('');
     setToast(`Sale recorded — ${formatINR(recordedTotal)}`);
     setSaleInProgress(false);
+    if (invoiceMeta) setInvoiceItems(newSales); // show the invoice right away
   }
 
   // ---- Backup file: move suits and sales between the downloaded copy and the web app ----
@@ -1486,7 +1785,7 @@ function AaraaPOS() {
               )}
               {diagOpen && (
                 <div className="mt-1 rounded-lg p-2 text-xs font-mono" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, color: COLORS.ink }}>
-                  <div className="mb-1" style={{ color: COLORS.inkSoft }}>Scan a barcode — every key the scanner sends shows here in order, as key+milliseconds since the previous key. (R) means the phone flagged it as a held-key repeat. Typed so far: "{scanValue}"</div>
+                  <div className="mb-1" style={{ color: COLORS.inkSoft }}>Scan a barcode — every key the scanner sends shows here in order, as key+milliseconds since the previous key. (R) means the phone flagged it as a held-key repeat. ^ means the key was released. Typed so far: "{scanValue}"</div>
                   {diagLog.length === 0 ? <div>Nothing received yet</div> : <div style={{ wordBreak: 'break-word', lineHeight: 1.7 }}>{diagLog.join('   ')}</div>}
                 </div>
               )}
@@ -1713,6 +2012,22 @@ function AaraaPOS() {
               </div>
             )}
 
+            {cart.length > 0 && needsInvoice && (
+              <div className="mt-3 rounded-xl p-3" style={{ background: COLORS.card, border: `1px solid ${invoiceMissing ? COLORS.rust : COLORS.border}` }}>
+                <div className="text-xs mb-2" style={{ color: invoiceMissing ? COLORS.rust : COLORS.inkSoft }}>
+                  Online payment — invoice details (required)
+                </div>
+                <div className="grid grid-cols-2 gap-2">
+                  <Field label="Customer name">
+                    <input value={custName} onChange={(e) => setCustName(e.target.value)} className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+                  </Field>
+                  <Field label="Mobile number">
+                    <input type="tel" inputMode="numeric" value={custMobile} onChange={(e) => setCustMobile(e.target.value)} placeholder="10 digits" className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+                  </Field>
+                </div>
+              </div>
+            )}
+
             {cart.length > 0 && (() => {
               const noteRequired = (Number(payDue) || 0) > 0;
               const noteMissing = noteRequired && !saleNote.trim();
@@ -1935,11 +2250,11 @@ function AaraaPOS() {
         <div className="absolute bottom-16 left-0 right-0 px-5 pb-2">
           <button
             onClick={completeSale}
-            disabled={saleInProgress || paymentAssigned !== cartTotal || ((Number(payDue) || 0) > 0 && !saleNote.trim())}
+            disabled={saleInProgress || paymentAssigned !== cartTotal || invoiceMissing || ((Number(payDue) || 0) > 0 && !saleNote.trim())}
             className="w-full rounded-xl py-3 flex items-center justify-between px-4 shadow-lg"
             style={{
               background: COLORS.primary,
-              opacity: saleInProgress || paymentAssigned !== cartTotal || ((Number(payDue) || 0) > 0 && !saleNote.trim()) ? 0.5 : 1,
+              opacity: saleInProgress || paymentAssigned !== cartTotal || invoiceMissing || ((Number(payDue) || 0) > 0 && !saleNote.trim()) ? 0.5 : 1,
             }}
           >
             <span className="text-white font-medium">{saleInProgress ? 'Recording…' : 'Complete sale'}</span>
@@ -1995,9 +2310,12 @@ function AaraaPOS() {
         />
       )}
 
+      {invoiceItems && <InvoiceModal items={invoiceItems} onClose={() => setInvoiceItems(null)} />}
+
       {viewingBillId && viewingBillItems.length > 0 && (
         <BillDetailModal
           items={viewingBillItems}
+          onInvoice={() => setInvoiceItems(viewingBillItems)}
           products={products}
           onClose={() => setViewingBillId(null)}
           onEditItem={(item) => setEditingSale(item)}
@@ -2376,7 +2694,69 @@ function PrintLabelsModal({ products, selection, onToggle, onSetQty, onClose, on
   );
 }
 
-function BillDetailModal({ items, products, onClose, onEditItem }) {
+function InvoiceModal({ items, onClose }) {
+  const [preview, setPreview] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+  const canvasRef = useRef(null);
+  const data = buildInvoiceData(items);
+
+  useEffect(() => {
+    let alive = true;
+    drawInvoiceCanvas(buildInvoiceData(items)).then((c) => {
+      if (!alive) return;
+      canvasRef.current = c;
+      setPreview(c.toDataURL('image/jpeg', 0.85));
+    });
+    return () => { alive = false; };
+  }, [items]);
+
+  async function share() {
+    if (!canvasRef.current || busy) return;
+    setBusy(true);
+    setMsg('');
+    try {
+      const r = await shareInvoicePdf(data, canvasRef.current);
+      if (r === 'saved') setMsg('Invoice PDF saved');
+    } catch (e) {
+      setMsg('Could not create the invoice PDF');
+    }
+    setBusy(false);
+  }
+
+  return (
+    <div className="fixed inset-0 flex items-end justify-center z-20" style={{ background: 'rgba(43,36,30,0.6)' }}>
+      <div className="w-full rounded-t-2xl overflow-y-auto" style={{ background: COLORS.bg, maxHeight: '92vh' }}>
+        <div className="flex items-center justify-between px-5 pt-5 pb-3">
+          <div className="text-lg font-semibold" style={{ color: COLORS.ink }}>Invoice {data.no}</div>
+          <button onClick={onClose}><X size={20} color={COLORS.inkSoft} /></button>
+        </div>
+        <div className="px-5 pb-5">
+          <button
+            type="button"
+            onClick={share}
+            disabled={!preview || busy}
+            className="w-full rounded-xl py-3 font-medium text-white mb-3"
+            style={{ background: COLORS.primary, opacity: !preview || busy ? 0.5 : 1 }}
+          >
+            {busy ? 'Preparing…' : 'Share / save invoice PDF'}
+          </button>
+          {msg && <div className="text-xs mb-2" style={{ color: COLORS.teal }}>{msg}</div>}
+          {preview ? (
+            <img src={preview} alt="Invoice" className="w-full rounded-lg" style={{ border: `1px solid ${COLORS.border}` }} />
+          ) : (
+            <div className="text-sm text-center py-10" style={{ color: COLORS.inkSoft }}>Preparing invoice…</div>
+          )}
+          <button type="button" onClick={onClose} className="w-full rounded-xl py-3 mt-3 font-medium" style={{ background: COLORS.chip, color: COLORS.primary }}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function BillDetailModal({ items, products, onClose, onEditItem, onInvoice }) {
   const billTotal = items.reduce((sum, s) => sum + s.total, 0);
   const first = items[0];
   const sharedNote = items.find((s) => s.note)?.note;
@@ -2403,6 +2783,12 @@ function BillDetailModal({ items, products, onClose, onEditItem }) {
             <div className="text-sm mb-3 rounded-xl px-3 py-2" style={{ background: '#fff', border: `1px solid ${COLORS.border}`, color: COLORS.gold }}>
               {sharedNote}
             </div>
+          )}
+
+          {items.some((x) => x.invoice) && (
+            <button type="button" onClick={onInvoice} className="w-full rounded-xl py-2 mb-3 text-sm font-medium" style={{ background: COLORS.chip, color: COLORS.primary }}>
+              View / share invoice {items.find((x) => x.invoice).invoice.no}
+            </button>
           )}
 
           <div className="space-y-2 mb-4">
