@@ -2273,6 +2273,20 @@ function AaraaPOS() {
                                 {paymentSplitLabel(billSplit) && ` · ${paymentSplitLabel(billSplit)}`}
                               </div>
                               {sharedNote && <div className="text-xs mt-0.5 truncate" style={{ color: COLORS.gold }}>{sharedNote}</div>}
+                              {(() => {
+                                const inv = (items.find((s) => s.invoice) || {}).invoice;
+                                if (!inv) return null;
+                                return (
+                                  <span
+                                    role="button"
+                                    onClick={(e) => { e.stopPropagation(); setInvoiceItems(items); }}
+                                    className="text-xs px-2 py-0.5 rounded-full inline-block mt-1 max-w-full truncate"
+                                    style={{ background: COLORS.chip, color: COLORS.primary, border: `1px solid ${COLORS.border}` }}
+                                  >
+                                    Invoice {inv.no}{inv.customerName ? ` · ${inv.customerName}` : ''}{inv.basis === 'online' ? ' · online part' : ''}
+                                  </span>
+                                );
+                              })()}
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
                               <div className="text-right">
@@ -2757,12 +2771,48 @@ function PrintLabelsModal({ products, selection, onToggle, onSetQty, onClose, on
   );
 }
 
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (e) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch (e2) {
+      return false;
+    }
+  }
+}
+
 function InvoiceModal({ items, onClose }) {
   const [preview, setPreview] = useState('');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState('');
   const canvasRef = useRef(null);
   const data = buildInvoiceData(items);
+  const [copied, setCopied] = useState(false);
+
+  async function copyMobile() {
+    if (!data.mobile) return;
+    const ok = await copyText(data.mobile);
+    setCopied(ok);
+    if (ok) setTimeout(() => setCopied(false), 4000);
+  }
+
+  // Best effort: copy the customer's number as soon as the invoice opens (some browsers only allow it on a tap)
+  useEffect(() => {
+    if (data.mobile) copyText(data.mobile).then(setCopied);
+    // eslint-disable-next-line
+  }, []);
 
   useEffect(() => {
     let alive = true;
@@ -2778,6 +2828,7 @@ function InvoiceModal({ items, onClose }) {
     if (!canvasRef.current || busy) return;
     setBusy(true);
     setMsg('');
+    if (data.mobile) copyMobile(); // copy first (needs the tap), so it can be pasted in WhatsApp search
     try {
       const r = await shareInvoicePdf(data, canvasRef.current);
       if (r === 'saved') setMsg('Invoice PDF saved');
@@ -2795,6 +2846,16 @@ function InvoiceModal({ items, onClose }) {
           <button onClick={onClose}><X size={20} color={COLORS.inkSoft} /></button>
         </div>
         <div className="px-5 pb-5">
+          {data.mobile && (
+            <button
+              type="button"
+              onClick={copyMobile}
+              className="w-full rounded-xl py-2 mb-2 text-sm flex items-center justify-center gap-2"
+              style={{ background: COLORS.chip, color: COLORS.primary, border: `1px solid ${COLORS.border}` }}
+            >
+              {copied ? `Copied ${data.mobile} — paste in WhatsApp search` : `Copy mobile ${data.mobile}`}
+            </button>
+          )}
           <button
             type="button"
             onClick={share}
