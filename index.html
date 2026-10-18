@@ -309,8 +309,9 @@ function invoiceFinancialYear(date) {
 function nextInvoiceSeq(sales) {
   return sales.reduce((m, x) => Math.max(m, (x.invoice && x.invoice.seq) || 0), 0) + 1;
 }
-function makeInvoiceMeta(seq, date, name, mobile) {
-  return { seq, no: `AC/${invoiceFinancialYear(date)}/${String(seq).padStart(4, '0')}`, customerName: name, customerMobile: mobile };
+function makeInvoiceMeta(seq, date, name, mobile, basis, amount) {
+  // basis 'full' = invoice for the whole bill; 'online' = invoice only for the part paid online (amount)
+  return { seq, no: `AC/${invoiceFinancialYear(date)}/${String(seq).padStart(4, '0')}`, customerName: name, customerMobile: mobile, basis: basis || 'full', amount };
 }
 
 function numberToWordsIN(num) {
@@ -350,7 +351,22 @@ function buildInvoiceData(items) {
       rows.push({ meters: INVOICE_METERS_PER_SUIT, rate: taxable / INVOICE_METERS_PER_SUIT, taxable, amount });
     }
   }
-  const total = round2(rows.reduce((sum, r) => sum + r.amount, 0)); // after any bargaining
+  let split = aggregateBillSplit(items);
+  const fullTotal = round2(rows.reduce((sum, r) => sum + r.amount, 0)); // after any bargaining
+  if (meta.basis === 'online' && Number(meta.amount) > 0 && Number(meta.amount) < fullTotal) {
+    // Invoice only the online part: scale every suit's amount down in proportion.
+    const target = round2(Number(meta.amount));
+    let left = target;
+    rows.forEach((r, i) => {
+      const amount = i === rows.length - 1 ? left : round2((r.amount * target) / fullTotal);
+      left = round2(left - amount);
+      r.amount = amount;
+      r.taxable = round2(amount / (1 + INVOICE_GST_RATE / 100));
+      r.rate = r.taxable / INVOICE_METERS_PER_SUIT;
+    });
+    split = { cash: 0, online: target, due: 0 };
+  }
+  const total = round2(rows.reduce((sum, r) => sum + r.amount, 0));
   const taxable = round2(rows.reduce((sum, r) => sum + r.taxable, 0));
   return {
     no: meta.no || '',
@@ -361,7 +377,7 @@ function buildInvoiceData(items) {
     taxable,
     gst: round2(total - taxable),
     total,
-    split: aggregateBillSplit(items),
+    split,
   };
 }
 
@@ -803,6 +819,7 @@ function AaraaPOS() {
   const [payCash, setPayCash] = useState('');
   const [custName, setCustName] = useState('');
   const [custMobile, setCustMobile] = useState('');
+  const [invoiceBasis, setInvoiceBasis] = useState(''); // '' | 'full' | 'online' — asked when payment is part online, part cash/due
   const [invoiceItems, setInvoiceItems] = useState(null); // sale lines of the bill whose invoice is open
   const [finalOverride, setFinalOverride] = useState(''); // bargained final amount for the bill (empty = no change)
   const [payOnline, setPayOnline] = useState('');
@@ -1197,7 +1214,8 @@ function AaraaPOS() {
   const paymentAssigned = (Number(payCash) || 0) + (Number(payOnline) || 0) + (Number(payDue) || 0);
   const needsInvoice = (Number(payOnline) || 0) > 0; // an online payment needs a tax invoice
   const custMobileClean = custMobile.replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
-  const invoiceMissing = needsInvoice && (!custName.trim() || custMobileClean.length !== 10);
+  const partlyOnline = needsInvoice && (Number(payCash) || 0) + (Number(payDue) || 0) > 0;
+  const invoiceMissing = needsInvoice && (!custName.trim() || custMobileClean.length !== 10 || (partlyOnline && !invoiceBasis));
 
   function holdCurrentCart() {
     if (cart.length === 0) return;
@@ -1210,6 +1228,7 @@ function AaraaPOS() {
     setFinalOverride('');
     setCustName('');
     setCustMobile('');
+    setInvoiceBasis('');
     setSaleNote('');
     setPayCash('');
     setPayOnline('');
@@ -1235,6 +1254,7 @@ function AaraaPOS() {
     setFinalOverride('');
     setCustName('');
     setCustMobile('');
+    setInvoiceBasis('');
     setSaleNote(held.note);
     setPayCash(held.payCash);
     setPayOnline(held.payOnline);
@@ -1262,7 +1282,11 @@ function AaraaPOS() {
       return;
     }
     if (invoiceMissing) {
-      setScanError('Online payment needs an invoice — enter the customer\'s name and a 10-digit mobile number');
+      setScanError(
+        partlyOnline && !invoiceBasis && custName.trim() && custMobileClean.length === 10
+          ? 'Choose whether the invoice is for the full bill or the online amount only'
+          : 'Online payment needs an invoice — enter the customer\'s name and a 10-digit mobile number'
+      );
       return;
     }
     setSaleInProgress(true);
@@ -1300,7 +1324,7 @@ function AaraaPOS() {
     // With a bargained total, spread the final amount over the items by their share of the list
     // total (the last item takes the rounding remainder) so line totals add up to the bill exactly.
     let totalLeft = cartTotal;
-    const invoiceMeta = needsInvoice ? makeInvoiceMeta(nextInvoiceSeq(sales), now, custName.trim(), custMobileClean) : undefined;
+    const invoiceMeta = needsInvoice ? makeInvoiceMeta(nextInvoiceSeq(sales), now, custName.trim(), custMobileClean, partlyOnline && invoiceBasis === 'online' ? 'online' : 'full', partlyOnline && invoiceBasis === 'online' ? billSplit.online : cartTotal) : undefined;
     const newSales = cart.map((c, idx) => {
       const listTotal = c.price * c.qty;
       const isLast = idx === cart.length - 1;
@@ -1352,6 +1376,7 @@ function AaraaPOS() {
     setPayDue('');
     setCustName('');
     setCustMobile('');
+    setInvoiceBasis('');
     setToast(`Sale recorded — ${formatINR(recordedTotal)}`);
     setSaleInProgress(false);
     if (invoiceMeta) setInvoiceItems(newSales); // show the invoice right away
@@ -2035,6 +2060,34 @@ function AaraaPOS() {
                     <input type="tel" inputMode="numeric" value={custMobile} onChange={(e) => setCustMobile(e.target.value)} placeholder="10 digits" className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
                   </Field>
                 </div>
+                {partlyOnline && (
+                  <div className="mt-3">
+                    <div className="text-xs mb-1" style={{ color: !invoiceBasis ? COLORS.rust : COLORS.inkSoft }}>
+                      Part of the bill is not online. Make the invoice for:
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      {[
+                        { id: 'full', label: 'Full bill', amt: cartTotal },
+                        { id: 'online', label: 'Online amount only', amt: Number(payOnline) || 0 },
+                      ].map((o) => (
+                        <button
+                          key={o.id}
+                          type="button"
+                          onClick={() => setInvoiceBasis(o.id)}
+                          className="rounded-xl py-2 px-2 text-sm text-center"
+                          style={{
+                            background: invoiceBasis === o.id ? COLORS.primary : COLORS.chip,
+                            color: invoiceBasis === o.id ? '#fff' : COLORS.ink,
+                            border: `1px solid ${invoiceBasis === o.id ? COLORS.primary : COLORS.border}`,
+                          }}
+                        >
+                          <div className="font-medium">{o.label}</div>
+                          <div className="text-xs">{formatINR(o.amt)}</div>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
