@@ -336,24 +336,30 @@ function numberToWordsIN(num) {
   return `Rupees ${words(rupees)}${paise ? ' and ' + words(paise) + ' Paise' : ''} Only`;
 }
 
-// Works out every invoice figure from the sale lines of one bill.
+// Works out every invoice figure from the sale lines of one bill. Each suit gets its own row.
 function buildInvoiceData(items) {
   const meta = (items.find((x) => x.invoice) || {}).invoice || {};
-  const total = items.reduce((sum, x) => sum + Number(x.total || 0), 0); // after any bargaining
-  const suits = items.reduce((sum, x) => sum + Number(x.qty || 0), 0);
-  const meters = round2(suits * INVOICE_METERS_PER_SUIT);
-  const taxable = round2(total / (1 + INVOICE_GST_RATE / 100));
-  const gst = round2(total - taxable);
+  const rows = [];
+  for (const x of items) {
+    const qty = Math.max(1, Number(x.qty) || 1);
+    let left = round2(Number(x.total || 0));
+    for (let i = 0; i < qty; i++) {
+      const amount = i === qty - 1 ? left : round2(Number(x.total || 0) / qty); // what the customer pays for this suit
+      left = round2(left - amount);
+      const taxable = round2(amount / (1 + INVOICE_GST_RATE / 100));
+      rows.push({ meters: INVOICE_METERS_PER_SUIT, rate: taxable / INVOICE_METERS_PER_SUIT, taxable, amount });
+    }
+  }
+  const total = round2(rows.reduce((sum, r) => sum + r.amount, 0)); // after any bargaining
+  const taxable = round2(rows.reduce((sum, r) => sum + r.taxable, 0));
   return {
     no: meta.no || '',
     date: items[0].timestamp,
     name: meta.customerName || '',
     mobile: meta.customerMobile || '',
-    suits,
-    meters,
-    rate: meters > 0 ? taxable / meters : 0,
+    rows,
     taxable,
-    gst,
+    gst: round2(total - taxable),
     total,
     split: aggregateBillSplit(items),
   };
@@ -371,7 +377,8 @@ function loadImage(src) {
 // Draws the invoice on an A4 page (1240 x 1754 px = 150 dpi).
 async function drawInvoiceCanvas(d) {
   const W = 1240;
-  const H = 1754;
+  const ROW_H = 62;
+  const H = 1754 + Math.max(0, d.rows.length - 8) * ROW_H; // taller page when there are many suits
   const M = 70;
   const canvas = document.createElement('canvas');
   canvas.width = W;
@@ -430,18 +437,21 @@ async function drawInvoiceCanvas(d) {
   text('Qty (m)', cx.qty, top + 45, 25, { bold: true });
   text('Rate / m', cx.rate, top + 45, 25, { bold: true, align: 'right' });
   text('Amount', cx.amt, top + 45, 25, { bold: true, align: 'right' });
-  const ry = top + 130;
-  text('1', cx.no, ry, 28);
-  text('Fabrics', cx.desc, ry, 30, { bold: true });
-  text(INVOICE_HSN, cx.hsn, ry, 28);
-  text(String(d.meters), cx.qty, ry, 28);
-  text(fmt2(d.rate), cx.rate, ry, 28, { align: 'right' });
-  text(fmt2(d.taxable), cx.amt, ry, 28, { align: 'right' });
-  text(`${d.suits} suit${d.suits === 1 ? '' : 's'} × ${INVOICE_METERS_PER_SUIT} m`, cx.desc, ry + 36, 22, { color: soft });
-  rule(ry + 70);
+  let ry = top + 118;
+  d.rows.forEach((r, i) => {
+    text(String(i + 1), cx.no, ry, 28);
+    text('Fabrics', cx.desc, ry, 30, { bold: true });
+    text(INVOICE_HSN, cx.hsn, ry, 28);
+    text(String(r.meters), cx.qty, ry, 28);
+    text(fmt2(r.rate), cx.rate, ry, 28, { align: 'right' });
+    text(fmt2(r.taxable), cx.amt, ry, 28, { align: 'right' });
+    rule(ry + 24);
+    ry += ROW_H;
+  });
+  ry -= ROW_H - 24; // bottom of the last row
 
   // Totals
-  let y = ry + 140;
+  let y = ry + 70;
   const labelX = 700;
   const row = (label, value, bold) => {
     text(label, labelX, y, bold ? 32 : 28, { bold });
@@ -519,7 +529,7 @@ function buildSinglePagePdf(jpeg, imgW, imgH, pageW, pageH) {
 // Shares the invoice PDF (WhatsApp etc. via the phone's share sheet), else saves it.
 async function shareInvoicePdf(d, canvas) {
   const jpeg = await canvasToJpegBytes(canvas);
-  const blob = buildSinglePagePdf(jpeg, canvas.width, canvas.height, 595.28, 841.89);
+  const blob = buildSinglePagePdf(jpeg, canvas.width, canvas.height, 595.28, (595.28 * canvas.height) / canvas.width);
   const filename = `Invoice-${(d.no || 'Aaraa').replace(/[^A-Za-z0-9-]/g, '-')}.pdf`;
   try {
     const file = new File([blob], filename, { type: 'application/pdf' });
