@@ -2277,6 +2277,12 @@ function AaraaPOS() {
                                 const inv = (items.find((s) => s.invoice) || {}).invoice;
                                 if (!inv) return null;
                                 return (
+                                  <>
+                                  {inv.customerName && (
+                                    <div className="text-xs font-medium mt-0.5 truncate" style={{ color: COLORS.ink }}>
+                                      Customer: {inv.customerName}{inv.customerMobile ? ` · ${inv.customerMobile}` : ''}
+                                    </div>
+                                  )}
                                   <span
                                     role="button"
                                     onClick={(e) => { e.stopPropagation(); setInvoiceItems(items); }}
@@ -2285,6 +2291,7 @@ function AaraaPOS() {
                                   >
                                     Invoice {inv.no}{inv.customerName ? ` · ${inv.customerName}` : ''}{inv.basis === 'online' ? ' · online part' : ''}
                                   </span>
+                                  </>
                                 );
                               })()}
                             </div>
@@ -2895,6 +2902,12 @@ function BillDetailModal({ items, products, onClose, onEditItem, onInvoice }) {
             <div className="text-xs" style={{ color: COLORS.inkSoft }}>
               {new Date(first.timestamp).toLocaleString('en-IN')}
             </div>
+            {(items.find((x) => x.invoice) || {}).invoice?.customerName && (
+              <div className="text-xs mt-0.5 font-medium" style={{ color: COLORS.ink }}>
+                Customer: {items.find((x) => x.invoice).invoice.customerName}
+                {items.find((x) => x.invoice).invoice.customerMobile ? ` · ${items.find((x) => x.invoice).invoice.customerMobile}` : ''}
+              </div>
+            )}
             {paymentSplitText(billSplit) && (
               <div className="text-xs mt-0.5" style={{ color: COLORS.inkSoft }}>{paymentSplitText(billSplit)}</div>
             )}
