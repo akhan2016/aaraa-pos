@@ -807,6 +807,244 @@ function PrintLabel({ name, price, barcode, handwork }) {
   );
 }
 
+// ---- Shared online database (Supabase) for the GitHub / standalone copy ----
+// Staff sign in with their own email + password; everyone then reads and writes the same
+// suits and sales. Data lives in one table, pos_docs(collection, id, data, updated_at).
+// Only used when Claude's own shared storage isn't available (i.e. outside claude.ai).
+const SUPABASE_URL = 'https://kuiddsjbjcimebeibxwp.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_TbHZI7C85uBsUTA0-t4s8Q_Qg9N3T1e';
+const SUPA_SESSION_KEY = 'aaraa_supa_session';
+
+const supa = (() => {
+  let session = null; // { access_token, refresh_token, expires_at (seconds), email }
+  let pending = 0; // writes in flight
+  let writeSeq = 0; // bumped on every write, so a slow background refresh can't undo it
+  const caches = {}; // collection -> Map(id -> { updated_at, data })
+
+  function cache(name) {
+    if (!caches[name]) caches[name] = new Map();
+    return caches[name];
+  }
+  function saveSession() {
+    try {
+      if (session) localStorage.setItem(SUPA_SESSION_KEY, JSON.stringify(session));
+      else localStorage.removeItem(SUPA_SESSION_KEY);
+    } catch (e) {}
+  }
+  function loadSession() {
+    try {
+      const raw = localStorage.getItem(SUPA_SESSION_KEY);
+      return raw ? JSON.parse(raw) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+  function takeTokens(j) {
+    session = {
+      access_token: j.access_token,
+      refresh_token: j.refresh_token,
+      expires_at: j.expires_at || Math.floor(Date.now() / 1000) + (Number(j.expires_in) || 3600),
+      email: (j.user && j.user.email) || (session && session.email) || '',
+    };
+    saveSession();
+  }
+  async function authCall(grant, body) {
+    const res = await fetch(`${SUPABASE_URL}/auth/v1/token?grant_type=${grant}`, {
+      method: 'POST',
+      headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const j = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const err = new Error(j.error_description || j.msg || j.message || 'Sign-in failed');
+      err.status = res.status;
+      throw err;
+    }
+    return j;
+  }
+  async function signIn(email, password) {
+    const j = await authCall('password', { email: String(email).trim(), password });
+    takeTokens(j);
+    return session.email;
+  }
+  async function refresh() {
+    if (!session || !session.refresh_token) throw new Error('Not signed in');
+    const j = await authCall('refresh_token', { refresh_token: session.refresh_token });
+    takeTokens(j);
+  }
+  // Returns the signed-in email if a saved session still works, else ''.
+  async function restore() {
+    session = loadSession();
+    if (!session || !session.access_token) {
+      session = null;
+      return '';
+    }
+    try {
+      if (session.expires_at - 30 < Date.now() / 1000) await refresh();
+      return session.email || 'staff';
+    } catch (e) {
+      // Only drop the session if the server actually rejected it; offline keeps it for later.
+      if (e && e.status && e.status >= 400 && e.status < 500) {
+        session = null;
+        saveSession();
+        return '';
+      }
+      return session.email || 'staff';
+    }
+  }
+  function signOut() {
+    session = null;
+    saveSession();
+    Object.keys(caches).forEach((k) => delete caches[k]);
+  }
+  async function rest(path, opts = {}) {
+    if (!session) throw new Error('Not signed in');
+    if (session.expires_at - 30 < Date.now() / 1000) await refresh();
+    const go = () =>
+      fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+        ...opts,
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}`, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+      });
+    let res = await go();
+    if (res.status === 401) {
+      await refresh();
+      res = await go();
+    }
+    if (!res.ok) {
+      const t = await res.text().catch(() => '');
+      throw new Error(`Database error ${res.status}: ${t.slice(0, 160)}`);
+    }
+    return res.status === 204 ? null : res.json().catch(() => null);
+  }
+  // Every row of a collection (id + updated_at only), 1000 at a time.
+  async function listStamps(name) {
+    const out = [];
+    for (let from = 0; ; from += 1000) {
+      const rows = await rest(`pos_docs?collection=eq.${encodeURIComponent(name)}&select=id,updated_at&order=id&limit=1000&offset=${from}`);
+      out.push(...rows);
+      if (rows.length < 1000) break;
+    }
+    return out;
+  }
+  // Brings a collection up to date by downloading only rows that are new or changed.
+  // Returns { changed, list } without committing, so the caller can drop it if a write raced it.
+  async function pull(name) {
+    const have = cache(name);
+    const stamps = await listStamps(name);
+    const next = new Map();
+    const need = [];
+    let changed = stamps.length !== have.size;
+    for (const s of stamps) {
+      const old = have.get(s.id);
+      if (old && old.updated_at === s.updated_at) next.set(s.id, old);
+      else {
+        need.push(s.id);
+        changed = true;
+      }
+    }
+    for (let i = 0; i < need.length; i += 15) {
+      const chunk = need.slice(i, i + 15);
+      const inList = chunk.map((id) => `"${String(id).replace(/"/g, '\\"')}"`).join(',');
+      const rows = await rest(`pos_docs?collection=eq.${encodeURIComponent(name)}&id=in.(${encodeURIComponent(inList)})&select=id,updated_at,data`);
+      rows.forEach((r) => next.set(r.id, { updated_at: r.updated_at, data: r.data }));
+    }
+    for (const id of next.keys()) if (!next.get(id).data) next.delete(id);
+    return { changed, next, list: Array.from(next.values()).map((v) => v.data) };
+  }
+  function commit(name, res) {
+    caches[name] = res.next;
+  }
+  async function upsert(name, id, data) {
+    pending++;
+    writeSeq++;
+    try {
+      const rows = await rest('pos_docs?on_conflict=collection,id&select=id,updated_at', {
+        method: 'POST',
+        headers: { Prefer: 'resolution=merge-duplicates,return=representation' },
+        body: JSON.stringify({ collection: name, id: String(id), data }),
+      });
+      const r = rows && rows[0];
+      cache(name).set(String(id), { updated_at: r ? r.updated_at : '', data });
+    } finally {
+      pending--;
+      writeSeq++;
+    }
+  }
+  async function remove(name, id) {
+    pending++;
+    writeSeq++;
+    try {
+      await rest(`pos_docs?collection=eq.${encodeURIComponent(name)}&id=eq.${encodeURIComponent(String(id))}`, { method: 'DELETE' });
+      cache(name).delete(String(id));
+    } finally {
+      pending--;
+      writeSeq++;
+    }
+  }
+  // Same shape as Claude's own storage, so the rest of the app doesn't care which one it has.
+  const db = {
+    isSupabase: true,
+    collection(name) {
+      return {
+        async get() {
+          const res = await pull(name);
+          commit(name, res);
+          return { docs: res.list.map((d) => ({ data: () => d })) };
+        },
+        doc(id) {
+          return { set: (item) => upsert(name, id, item), delete: () => remove(name, id) };
+        },
+      };
+    },
+  };
+  return {
+    db,
+    signIn,
+    restore,
+    signOut,
+    pull,
+    commit,
+    email: () => (session && session.email) || '',
+    busy: () => pending > 0,
+    seq: () => writeSeq,
+  };
+})();
+
+
+function LoginScreen({ onLogin }) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function submit(e) {
+    e.preventDefault();
+    if (busy) return;
+    setBusy(true);
+    setError('');
+    try {
+      await onLogin(email, password);
+    } catch (err) {
+      setError(err && err.message ? err.message : 'Could not sign in');
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="flex items-center justify-center h-full px-6" style={{ background: COLORS.bg }}>
+      <form onSubmit={submit} className="w-full max-w-sm rounded-2xl p-6" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+        <img src={LOGO_DATA_URI} alt="Aaraa Creation" style={{ height: '34px', width: 'auto', display: 'block', marginBottom: '10px' }} />
+        <div className="text-lg font-semibold mb-1" style={{ color: COLORS.ink }}>Staff sign in</div>
+        <div className="text-xs mb-4" style={{ color: COLORS.inkSoft }}>Use the email and password given to you. Everyone signed in shares the same suits and sales.</div>
+        <input type="email" autoComplete="username" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="Email" className="w-full rounded-xl px-3 py-3 mb-2 text-base outline-none" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.ink, background: COLORS.bg }} />
+        <input type="password" autoComplete="current-password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Password" className="w-full rounded-xl px-3 py-3 mb-3 text-base outline-none" style={{ border: `1px solid ${COLORS.border}`, color: COLORS.ink, background: COLORS.bg }} />
+        {error && <div className="text-xs mb-3" style={{ color: COLORS.rust }}>{error}</div>}
+        <button type="submit" disabled={busy || !email.trim() || !password} className="w-full rounded-xl py-3 font-medium text-white" style={{ background: COLORS.primary, opacity: busy || !email.trim() || !password ? 0.5 : 1 }}>
+          {busy ? 'Signing in…' : 'Sign in'}
+        </button>
+      </form>
+    </div>
+  );
+}
+
 function AaraaPOS() {
   const [tab, setTab] = useState('sell');
   const [products, setProducts] = useState([]);
@@ -838,6 +1076,11 @@ function AaraaPOS() {
   const [editingSale, setEditingSale] = useState(null);
   const [viewingBillId, setViewingBillId] = useState(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [cloud, setCloud] = useState(false); // using the shared online database
+  const [needLogin, setNeedLogin] = useState(false);
+  const [cloudEmail, setCloudEmail] = useState('');
+  const [localLeft, setLocalLeft] = useState(null); // suits/sales on this device that aren't in the shared database yet
+  const localCheckedRef = useRef(false);
   const scanRef = useRef(null);
   const scanTimerRef = useRef(null); // pending auto-submit of a scanner burst
   const scanBufRef = useRef(''); // latest scan-box text, updated instantly (state lags a render behind fast scanners)
@@ -903,11 +1146,118 @@ function AaraaPOS() {
 
   useEffect(() => {
     (async () => {
-      dbRef.current = await getClaudeDb();
+      let db = await getClaudeDb();
+      if (!db) {
+        // Outside claude.ai: use the shared online database, after staff sign in.
+        const who = await supa.restore();
+        if (!who) {
+          setNeedLogin(true);
+          setLoaded(true);
+          return;
+        }
+        db = supa.db;
+        setCloudEmail(who);
+        setCloud(true);
+      }
+      dbRef.current = db;
       await loadData();
       setLoaded(true);
     })();
   }, [loadData]);
+
+  async function handleLogin(email, password) {
+    const who = await supa.signIn(email, password);
+    dbRef.current = supa.db;
+    setCloudEmail(who);
+    setCloud(true);
+    setNeedLogin(false);
+    await loadData();
+  }
+
+  function handleSignOut() {
+    supa.signOut();
+    dbRef.current = null;
+    productsRef.current = [];
+    salesRef.current = [];
+    setProducts([]);
+    setSales([]);
+    localCheckedRef.current = false;
+    setLocalLeft(null);
+    setCloud(false);
+    setCloudEmail('');
+    setNeedLogin(true);
+  }
+
+  // Quietly pulls other staff's changes (new suits, sales, stock) into this screen.
+  const pollCloud = useCallback(async () => {
+    if (!supa.email() || supa.busy()) return;
+    const seq = supa.seq();
+    try {
+      const [p, s] = await Promise.all([supa.pull('products'), supa.pull('sales')]);
+      if (supa.busy() || seq !== supa.seq()) return; // a save happened meanwhile; try again next time
+      if (p.changed) {
+        supa.commit('products', p);
+        const list = [...p.list].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+        productsRef.current = list;
+        setProducts(list);
+      }
+      if (s.changed) {
+        supa.commit('sales', s);
+        const list = [...s.list].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+        salesRef.current = list;
+        setSales(list);
+      }
+    } catch (e) {
+      console.error('background refresh failed', e);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!cloud) return;
+    const t = setInterval(() => {
+      if (document.visibilityState === 'visible') pollCloud();
+    }, 8000);
+    const onVis = () => document.visibilityState === 'visible' && pollCloud();
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      clearInterval(t);
+      document.removeEventListener('visibilitychange', onVis);
+    };
+  }, [cloud, pollCloud]);
+
+  // First time on a device: offer to move suits/sales saved on it into the shared database.
+  useEffect(() => {
+    if (!loaded || !cloud || localCheckedRef.current) return;
+    localCheckedRef.current = true;
+    (async () => {
+      const lp = await localStore.get('aaraa_products');
+      const ls = await localStore.get('aaraa_sales');
+      const haveP = new Set(productsRef.current.map((x) => x.barcode));
+      const haveS = new Set(salesRef.current.map((x) => x.id));
+      const p = (Array.isArray(lp) ? lp : []).filter((x) => x && !haveP.has(x.barcode));
+      const sl = (Array.isArray(ls) ? ls : []).filter((x) => x && !haveS.has(x.id));
+      if (p.length || sl.length) setLocalLeft({ p, s: sl });
+    })();
+  }, [loaded, cloud]);
+
+  async function uploadLocalData() {
+    if (!localLeft) return;
+    const { p, s: sl } = localLeft;
+    let ok = true;
+    if (p.length) ok = (await persistProducts([...p, ...productsRef.current])) && ok;
+    if (sl.length) {
+      const merged = [...sl, ...salesRef.current].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+      ok = (await persistSales(merged)) && ok;
+    }
+    if (ok) {
+      await localStore.set('aaraa_products', []);
+      await localStore.set('aaraa_sales', []);
+      setLocalLeft(null);
+      setToast(`Uploaded ${p.length} suits and ${sl.length} sales to the shared database`);
+    } else {
+      setToast('Upload failed — check the internet and try again');
+    }
+  }
 
   async function handleRefresh() {
     setRefreshing(true);
@@ -1290,12 +1640,13 @@ function AaraaPOS() {
       return;
     }
     setSaleInProgress(true);
+    if (cloud) await pollCloud(); // other staff may have just sold the same suit
 
     // Re-check stock against the latest data right before committing, in case it
     // changed since items were scanned (e.g. an earlier accidental double-tap).
     const shortages = [];
     for (const c of cart) {
-      const live = products.find((p) => p.barcode === c.barcode);
+      const live = productsRef.current.find((p) => p.barcode === c.barcode);
       if (live && live.stock !== '' && live.stock != null && Number(live.stock) < c.qty) {
         shortages.push({ name: c.name, available: Number(live.stock) });
       }
@@ -1324,7 +1675,7 @@ function AaraaPOS() {
     // With a bargained total, spread the final amount over the items by their share of the list
     // total (the last item takes the rounding remainder) so line totals add up to the bill exactly.
     let totalLeft = cartTotal;
-    const invoiceMeta = needsInvoice ? makeInvoiceMeta(nextInvoiceSeq(sales), now, custName.trim(), custMobileClean, partlyOnline && invoiceBasis === 'online' ? 'online' : 'full', partlyOnline && invoiceBasis === 'online' ? billSplit.online : cartTotal) : undefined;
+    const invoiceMeta = needsInvoice ? makeInvoiceMeta(nextInvoiceSeq(salesRef.current), now, custName.trim(), custMobileClean, partlyOnline && invoiceBasis === 'online' ? 'online' : 'full', partlyOnline && invoiceBasis === 'online' ? billSplit.online : cartTotal) : undefined;
     const newSales = cart.map((c, idx) => {
       const listTotal = c.price * c.qty;
       const isLast = idx === cart.length - 1;
@@ -1355,13 +1706,13 @@ function AaraaPOS() {
       };
     });
     const recordedTotal = cartTotal;
-    const ok = await persistSales([...newSales, ...sales]);
+    const ok = await persistSales([...newSales, ...salesRef.current]);
     if (!ok) {
       setToast('Could not save the sale — please try again');
       setSaleInProgress(false);
       return;
     }
-    const nextProducts = products.map((p) => {
+    const nextProducts = productsRef.current.map((p) => {
       const sold = cart.find((c) => c.barcode === p.barcode);
       if (sold && p.stock !== '' && p.stock != null) {
         return { ...p, stock: Math.max(0, Number(p.stock) - sold.qty) };
@@ -1699,6 +2050,8 @@ function AaraaPOS() {
     );
   const todayTotals = sumSplits(todaysBillGroups);
 
+  if (needLogin) return <LoginScreen onLogin={handleLogin} />;
+
   if (!loaded) {
     return (
       <div className="flex items-center justify-center h-full" style={{ background: COLORS.bg, color: COLORS.inkSoft }}>
@@ -1742,6 +2095,15 @@ function AaraaPOS() {
         </div>
       </div>
 
+      {localLeft && (
+        <div className="mx-5 mt-3 rounded-xl p-3 text-xs" style={{ background: '#FFF6DD', border: `1px solid ${COLORS.gold}`, color: COLORS.ink }}>
+          This device has {localLeft.p.length} suit{localLeft.p.length === 1 ? '' : 's'} and {localLeft.s.length} sale{localLeft.s.length === 1 ? '' : 's'} that are not in the shared database yet.
+          <div className="flex gap-4 mt-2">
+            <button type="button" onClick={uploadLocalData} className="font-medium underline" style={{ color: COLORS.primary }}>Upload them now</button>
+            <button type="button" onClick={() => setLocalLeft(null)} className="underline" style={{ color: COLORS.inkSoft }}>Not now</button>
+          </div>
+        </div>
+      )}
       <div className={`flex-1 overflow-y-auto ${tab === 'sell' && cart.length > 0 ? 'pb-96' : 'pb-24'}`}>
         {tab === 'sell' && (
           <div className="px-5 pt-4">
@@ -2133,6 +2495,11 @@ function AaraaPOS() {
               </button>
             </div>
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 -mt-2 text-xs" style={{ color: COLORS.inkSoft }}>
+              {cloud && (
+                <span>
+                  Shared database · {cloudEmail} · <button type="button" onClick={handleSignOut} className="underline">Sign out</button>
+                </span>
+              )}
               <button type="button" onClick={exportData} className="underline">Export backup</button>
               <button type="button" onClick={copyBackupText} className="underline">Copy backup</button>
               <button type="button" onClick={() => { setBackupText(''); setBackupMode('paste'); }} className="underline">Paste backup</button>
