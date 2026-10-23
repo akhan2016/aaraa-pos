@@ -981,6 +981,9 @@ const supa = (() => {
       writeSeq++;
     }
   }
+  async function rpc(name, args) {
+    return rest(`rpc/${name}`, { method: 'POST', body: JSON.stringify(args || {}) });
+  }
   // Same shape as Claude's own storage, so the rest of the app doesn't care which one it has.
   const db = {
     isSupabase: true,
@@ -1005,6 +1008,11 @@ const supa = (() => {
     pull,
     commit,
     email: () => (session && session.email) || '',
+    role: async () => {
+      const r = await rpc('pos_my_role');
+      return r === 'admin' ? 'admin' : 'staff';
+    },
+    nextInvoice: (fy) => rpc('pos_next_invoice', { fy }),
     busy: () => pending > 0,
     seq: () => writeSeq,
   };
@@ -1079,8 +1087,11 @@ function AaraaPOS() {
   const [cloud, setCloud] = useState(false); // using the shared online database
   const [needLogin, setNeedLogin] = useState(false);
   const [cloudEmail, setCloudEmail] = useState('');
+  const [role, setRole] = useState(''); // 'admin' | 'staff' ('' until known); only meaningful on the shared database
   const [localLeft, setLocalLeft] = useState(null); // suits/sales on this device that aren't in the shared database yet
   const localCheckedRef = useRef(false);
+  // Staff (everyone except admins) can sell and add suits, but not edit/delete or see totals. Unknown role counts as staff.
+  const isStaff = cloud && role !== 'admin';
   const scanRef = useRef(null);
   const scanTimerRef = useRef(null); // pending auto-submit of a scanner burst
   const scanBufRef = useRef(''); // latest scan-box text, updated instantly (state lags a render behind fast scanners)
@@ -1158,6 +1169,7 @@ function AaraaPOS() {
         db = supa.db;
         setCloudEmail(who);
         setCloud(true);
+        try { setRole(await supa.role()); } catch (e) { setRole('staff'); }
       }
       dbRef.current = db;
       await loadData();
@@ -1170,6 +1182,7 @@ function AaraaPOS() {
     dbRef.current = supa.db;
     setCloudEmail(who);
     setCloud(true);
+    try { setRole(await supa.role()); } catch (e) { setRole('staff'); }
     setNeedLogin(false);
     await loadData();
   }
@@ -1185,6 +1198,7 @@ function AaraaPOS() {
     setLocalLeft(null);
     setCloud(false);
     setCloudEmail('');
+    setRole('');
     setNeedLogin(true);
   }
 
@@ -1227,7 +1241,7 @@ function AaraaPOS() {
 
   // First time on a device: offer to move suits/sales saved on it into the shared database.
   useEffect(() => {
-    if (!loaded || !cloud || localCheckedRef.current) return;
+    if (!loaded || !cloud || role !== 'admin' || localCheckedRef.current) return;
     localCheckedRef.current = true;
     (async () => {
       const lp = await localStore.get('aaraa_products');
@@ -1238,7 +1252,7 @@ function AaraaPOS() {
       const sl = (Array.isArray(ls) ? ls : []).filter((x) => x && !haveS.has(x.id));
       if (p.length || sl.length) setLocalLeft({ p, s: sl });
     })();
-  }, [loaded, cloud]);
+  }, [loaded, cloud, role]);
 
   async function uploadLocalData() {
     if (!localLeft) return;
@@ -1675,7 +1689,18 @@ function AaraaPOS() {
     // With a bargained total, spread the final amount over the items by their share of the list
     // total (the last item takes the rounding remainder) so line totals add up to the bill exactly.
     let totalLeft = cartTotal;
-    const invoiceMeta = needsInvoice ? makeInvoiceMeta(nextInvoiceSeq(salesRef.current), now, custName.trim(), custMobileClean, partlyOnline && invoiceBasis === 'online' ? 'online' : 'full', partlyOnline && invoiceBasis === 'online' ? billSplit.online : cartTotal) : undefined;
+    let invoiceSeq = nextInvoiceSeq(salesRef.current);
+    if (needsInvoice && cloud) {
+      // Staff only see today's sales, so the database hands out the next invoice number itself.
+      try {
+        invoiceSeq = Number(await supa.nextInvoice(invoiceFinancialYear(now)));
+      } catch (e) {
+        setToast('Could not get an invoice number — check the internet and try again');
+        setSaleInProgress(false);
+        return;
+      }
+    }
+    const invoiceMeta = needsInvoice ? makeInvoiceMeta(invoiceSeq, now, custName.trim(), custMobileClean, partlyOnline && invoiceBasis === 'online' ? 'online' : 'full', partlyOnline && invoiceBasis === 'online' ? billSplit.online : cartTotal) : undefined;
     const newSales = cart.map((c, idx) => {
       const listTotal = c.price * c.qty;
       const isLast = idx === cart.length - 1;
@@ -2083,7 +2108,7 @@ function AaraaPOS() {
               <RefreshCw size={14} color={COLORS.primary} className={refreshing ? 'animate-spin' : ''} />
             </button>
           )}
-          {tab === 'sell' && (
+          {tab === 'sell' && !isStaff && (
             <div className="text-right">
               <div className="text-xs" style={{ color: COLORS.inkSoft }}>Received today</div>
               <div className="text-sm font-medium" style={{ color: COLORS.teal }}>{formatINR(todaysReceived)}</div>
@@ -2500,6 +2525,7 @@ function AaraaPOS() {
                   Shared database · {cloudEmail} · <button type="button" onClick={handleSignOut} className="underline">Sign out</button>
                 </span>
               )}
+              {!isStaff && (<>
               <button type="button" onClick={exportData} className="underline">Export backup</button>
               <button type="button" onClick={copyBackupText} className="underline">Copy backup</button>
               <button type="button" onClick={() => { setBackupText(''); setBackupMode('paste'); }} className="underline">Paste backup</button>
@@ -2507,8 +2533,9 @@ function AaraaPOS() {
                 Import file
                 <input ref={importInputRef} type="file" onChange={importData} style={{ position: 'absolute', width: 1, height: 1, opacity: 0, overflow: 'hidden' }} />
               </label>
+              </>)}
             </div>
-            {backupMode && (
+            {!isStaff && backupMode && (
               <div className="mb-3 rounded-xl p-3" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                 <div className="text-xs mb-2" style={{ color: COLORS.inkSoft }}>
                   {backupMode === 'copy'
@@ -2543,7 +2570,7 @@ function AaraaPOS() {
             ) : (
               <div className="grid grid-cols-2 gap-3">
                 {filteredProducts.map((p) => (
-                  <button key={p.barcode} onClick={() => setEditing(p)} className="text-left rounded-xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                  <button key={p.barcode} onClick={() => (isStaff ? setToast('Only the admin can edit or delete suits') : setEditing(p))} className="text-left rounded-xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                     <div className="w-full aspect-square" style={{ background: COLORS.chip }}>
                       {p.image && <img src={p.image} alt={p.name} className="w-full h-full object-cover" />}
                     </div>
@@ -2568,6 +2595,7 @@ function AaraaPOS() {
 
         {tab === 'history' && (
           <div className="px-5 pt-4">
+            {!isStaff && (<>
             <div className="rounded-xl p-4 mb-4" style={{ background: COLORS.primary }}>
               <div className="text-xs" style={{ color: '#F0D9E4' }}>Received today</div>
               <div className="text-2xl font-semibold text-white">{formatINR(todaysReceived)}</div>
@@ -2593,6 +2621,10 @@ function AaraaPOS() {
                 </div>
               </div>
             </div>
+            </>)}
+            {isStaff && (
+              <div className="text-xs mb-3" style={{ color: COLORS.inkSoft }}>Showing today's bills only.</div>
+            )}
             {sales.length === 0 ? (
               <div className="text-center py-16" style={{ color: COLORS.inkSoft }}>
                 <div className="text-sm">No sales recorded yet.</div>
@@ -2602,7 +2634,7 @@ function AaraaPOS() {
                 <div key={day} className="mb-5">
                   <div className="mb-2">
                     <div className="text-xs font-medium" style={{ color: COLORS.inkSoft }}>{day}</div>
-                    {(() => {
+                    {!isStaff && (() => {
                       const t = sumSplits(bills);
                       return (
                         <div className="text-xs" style={{ color: COLORS.inkSoft }}>
@@ -2769,7 +2801,7 @@ function AaraaPOS() {
           onInvoice={() => setInvoiceItems(viewingBillItems)}
           products={products}
           onClose={() => setViewingBillId(null)}
-          onEditItem={(item) => setEditingSale(item)}
+          onEditItem={isStaff ? undefined : (item) => setEditingSale(item)}
         />
       )}
 
@@ -3301,7 +3333,7 @@ function BillDetailModal({ items, products, onClose, onEditItem, onInvoice }) {
               return (
                 <button
                   key={s.id}
-                  onClick={() => onEditItem(s)}
+                  onClick={onEditItem ? () => onEditItem(s) : undefined}
                   className="w-full flex items-center gap-3 rounded-lg p-2 text-left"
                   style={{ background: '#fff', border: `1px solid ${COLORS.border}` }}
                 >
@@ -3323,7 +3355,7 @@ function BillDetailModal({ items, products, onClose, onEditItem, onInvoice }) {
             <span className="text-sm font-medium" style={{ color: COLORS.ink }}>Bill total</span>
             <span className="text-lg font-semibold" style={{ color: COLORS.ink }}>{formatINR(billTotal)}</span>
           </div>
-          <div className="text-xs text-center mt-3" style={{ color: COLORS.inkSoft }}>Tap an item to edit or delete it.</div>
+          {onEditItem && <div className="text-xs text-center mt-3" style={{ color: COLORS.inkSoft }}>Tap an item to edit or delete it.</div>}
         </div>
       </div>
     </div>
