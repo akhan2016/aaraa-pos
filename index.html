@@ -150,6 +150,13 @@ function aggregateBillSplit(items) {
   );
 }
 
+// Inside claude.ai a record must stay small, so photos are small. On your own site (shared database)
+// there is room for sharper photos, which look much better when zoomed.
+function photoSettings() {
+  const inClaude = typeof window !== 'undefined' && window.claude && typeof window.claude.use === 'function';
+  return inClaude ? { maxW: 420, quality: 0.6, totalLimit: 200000 } : { maxW: 900, quality: 0.72, totalLimit: 1500000 };
+}
+
 function resizeImage(file, maxW = 500, quality = 0.7) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -1019,6 +1026,61 @@ const supa = (() => {
 })();
 
 
+// Full-screen photo viewer: swipe/tap thumbnails to change photo, tap the photo to zoom in and drag to look around.
+function PhotoViewer({ product, onClose }) {
+  const photos = product.images && product.images.length ? product.images : product.image ? [product.image] : [];
+  const [idx, setIdx] = useState(0);
+  const [zoomed, setZoomed] = useState(false);
+  const touchX = useRef(null);
+  function go(d) {
+    setZoomed(false);
+    setIdx((i) => (i + d + photos.length) % photos.length);
+  }
+  return (
+    <div className="fixed inset-0 z-30 flex flex-col" style={{ background: 'rgba(0,0,0,0.94)' }}>
+      <div className="flex items-center justify-between px-4 py-3 text-white">
+        <div className="min-w-0">
+          <div className="text-sm font-medium truncate">{product.name}</div>
+          <div className="text-xs" style={{ color: '#D9CDBF' }}>{formatINR(product.price)}{photos.length > 1 ? ` · photo ${idx + 1} of ${photos.length}` : ''}</div>
+        </div>
+        <button type="button" onClick={onClose} className="p-2"><X size={24} color="#fff" /></button>
+      </div>
+      <div
+        className="flex-1 overflow-auto"
+        style={{ touchAction: zoomed ? 'pan-x pan-y' : 'pan-y' }}
+        onTouchStart={(e) => { touchX.current = e.touches[0].clientX; }}
+        onTouchEnd={(e) => {
+          if (zoomed || photos.length < 2 || touchX.current == null) return;
+          const dx = e.changedTouches[0].clientX - touchX.current;
+          if (Math.abs(dx) > 60) go(dx < 0 ? 1 : -1);
+          touchX.current = null;
+        }}
+      >
+        {photos.length ? (
+          <div style={{ width: zoomed ? '250%' : '100%', height: zoomed ? 'auto' : '100%', display: 'flex', alignItems: zoomed ? 'flex-start' : 'center', justifyContent: 'center' }}>
+            <img
+              src={photos[idx]}
+              alt={product.name}
+              onClick={() => setZoomed((z) => !z)}
+              style={zoomed ? { width: '100%', height: 'auto', cursor: 'zoom-out' } : { maxWidth: '100%', maxHeight: '100%', objectFit: 'contain', cursor: 'zoom-in' }}
+            />
+          </div>
+        ) : (
+          <div className="text-center text-sm py-20" style={{ color: '#D9CDBF' }}>No photo for this suit</div>
+        )}
+      </div>
+      <div className="px-4 py-3 flex items-center justify-center gap-2">
+        {photos.length > 1 && photos.map((src, i) => (
+          <button key={i} type="button" onClick={() => { setZoomed(false); setIdx(i); }} className="rounded-md overflow-hidden" style={{ width: 52, height: 52, border: i === idx ? '2px solid #fff' : '2px solid transparent', opacity: i === idx ? 1 : 0.6 }}>
+            <img src={src} alt="" className="w-full h-full object-cover" />
+          </button>
+        ))}
+        <div className="text-xs ml-2" style={{ color: '#D9CDBF' }}>{zoomed ? 'Tap photo to zoom out' : 'Tap photo to zoom in'}</div>
+      </div>
+    </div>
+  );
+}
+
 function LoginScreen({ onLogin }) {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -1087,6 +1149,7 @@ function AaraaPOS() {
   const [cloud, setCloud] = useState(false); // using the shared online database
   const [needLogin, setNeedLogin] = useState(false);
   const [cloudEmail, setCloudEmail] = useState('');
+  const [viewPhoto, setViewPhoto] = useState(null); // suit whose photo is open full-screen
   const [role, setRole] = useState(''); // 'admin' | 'staff' ('' until known); only meaningful on the shared database
   const [localLeft, setLocalLeft] = useState(null); // suits/sales on this device that aren't in the shared database yet
   const localCheckedRef = useRef(false);
@@ -2571,8 +2634,19 @@ function AaraaPOS() {
               <div className="grid grid-cols-2 gap-3">
                 {filteredProducts.map((p) => (
                   <button key={p.barcode} onClick={() => (isStaff ? setToast('Only the admin can edit or delete suits') : setEditing(p))} className="text-left rounded-xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-                    <div className="w-full aspect-square" style={{ background: COLORS.chip }}>
+                    <div className="w-full aspect-square relative" style={{ background: COLORS.chip }}>
                       {p.image && <img src={p.image} alt={p.name} className="w-full h-full object-cover" />}
+                      {p.image && (
+                        <span
+                          role="button"
+                          aria-label="Zoom photo"
+                          onClick={(e) => { e.stopPropagation(); setViewPhoto(p); }}
+                          className="absolute flex items-center justify-center rounded-full"
+                          style={{ right: 6, bottom: 6, width: 34, height: 34, background: 'rgba(43,36,30,0.65)' }}
+                        >
+                          <Search size={16} color="#fff" />
+                        </span>
+                      )}
                     </div>
                     <div className="p-2">
                       <div className="text-sm font-medium truncate" style={{ color: COLORS.ink }}>{p.name}</div>
@@ -2793,6 +2867,7 @@ function AaraaPOS() {
         />
       )}
 
+      {viewPhoto && <PhotoViewer product={products.find((x) => x.barcode === viewPhoto.barcode) || viewPhoto} onClose={() => setViewPhoto(null)} />}
       {invoiceItems && <InvoiceModal items={invoiceItems} onClose={() => setInvoiceItems(null)} />}
 
       {viewingBillId && viewingBillItems.length > 0 && (
@@ -2881,7 +2956,7 @@ function ProductForm({ product, onCancel, onSave, onDelete, generateBarcode, onP
     try {
       const added = [];
       for (const file of files.slice(0, MAX_PHOTOS - images.length)) {
-        added.push(await resizeImage(file, 420, 0.6)); // small enough that 4 photos fit in one record
+        added.push(await resizeImage(file, photoSettings().maxW, photoSettings().quality));
       }
       if (added.length) setImages((prev) => [...prev, ...added].slice(0, MAX_PHOTOS));
       if (files.length > MAX_PHOTOS - images.length) setError(`Only ${MAX_PHOTOS} photos per suit — extra ones were skipped`);
@@ -2930,7 +3005,7 @@ function ProductForm({ product, onCancel, onSave, onDelete, generateBarcode, onP
       setError('Price and barcode are required');
       return;
     }
-    if (images.reduce((n, s) => n + s.length, 0) > 200000) {
+    if (images.reduce((n, s) => n + s.length, 0) > photoSettings().totalLimit) {
       setError('The photos are too large to save together — remove one and try again.');
       return;
     }
