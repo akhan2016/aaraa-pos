@@ -2360,9 +2360,20 @@ function AaraaPOS() {
               <div className="space-y-3">
                 {cart.map((c) => (
                   <div key={c.barcode} className="flex items-center gap-3 rounded-xl p-2" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
-                    <div className="w-14 h-14 rounded-lg overflow-hidden flex-shrink-0" style={{ background: COLORS.chip }}>
+                    <button
+                      type="button"
+                      onClick={() => c.image && setViewPhoto(products.find((x) => x.barcode === c.barcode) || c)}
+                      className="w-14 h-14 rounded-lg overflow-hidden flex-shrink-0 relative"
+                      style={{ background: COLORS.chip }}
+                      aria-label="Zoom photo"
+                    >
                       {c.image && <img src={c.image} alt={c.name} className="w-full h-full object-cover" />}
-                    </div>
+                      {c.image && (
+                        <span className="absolute flex items-center justify-center rounded-full" style={{ right: 2, bottom: 2, width: 20, height: 20, background: 'rgba(43,36,30,0.65)' }}>
+                          <Search size={11} color="#fff" />
+                        </span>
+                      )}
+                    </button>
                     <div className="flex-1 min-w-0">
                       <div className="text-sm font-medium truncate" style={{ color: COLORS.ink }}>{c.name}</div>
                       <div className="flex items-center gap-1 text-xs" style={{ color: COLORS.inkSoft }}>
@@ -2867,7 +2878,7 @@ function AaraaPOS() {
         />
       )}
 
-      {viewPhoto && <PhotoViewer product={products.find((x) => x.barcode === viewPhoto.barcode) || viewPhoto} onClose={() => setViewPhoto(null)} />}
+      {viewPhoto && <PhotoViewer product={products.find((x) => x.barcode === viewPhoto.barcode) || viewPhoto} onClose={() => { setViewPhoto(null); setTimeout(() => scanRef.current && scanRef.current.focus(), 60); }} />}
       {invoiceItems && <InvoiceModal items={invoiceItems} onClose={() => setInvoiceItems(null)} />}
 
       {viewingBillId && viewingBillItems.length > 0 && (
