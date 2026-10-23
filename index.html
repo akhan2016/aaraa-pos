@@ -1136,6 +1136,7 @@ function AaraaPOS() {
   const [scanError, setScanError] = useState('');
   const [toast, setToast] = useState('');
   const [search, setSearch] = useState('');
+  const catalogSearchRef = useRef(null);
   const [editing, setEditing] = useState(null); // product object, 'new', or null
   const [printOpen, setPrintOpen] = useState(false);
   const [printSelection, setPrintSelection] = useState({}); // barcode -> qty
@@ -1425,6 +1426,30 @@ function AaraaPOS() {
     };
   }, [tab, sellModalOpen]);
 
+  // Catalog tab: a scanner gun types the barcode into the search box. Keep that box ready, and
+  // if a scan arrives while focus is elsewhere, send it there.
+  const catalogBlocked = !!(editing || cameraOpen || printOpen || viewingBillId || editingSale || viewPhoto);
+  useEffect(() => {
+    if (tab !== 'catalog' || catalogBlocked) return;
+    const t = setTimeout(() => catalogSearchRef.current && catalogSearchRef.current.focus(), 80);
+    function onKey(e) {
+      if (e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1) return;
+      const el = document.activeElement;
+      const tag = el && el.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      const box = catalogSearchRef.current;
+      if (box) {
+        box.focus();
+        box.select();
+      }
+    }
+    window.addEventListener('keydown', onKey, true);
+    return () => {
+      clearTimeout(t);
+      window.removeEventListener('keydown', onKey, true);
+    };
+  }, [tab, catalogBlocked]);
+
   useEffect(() => {
     if (!toast) return;
     const t = setTimeout(() => setToast(''), 2200);
@@ -1549,6 +1574,12 @@ function AaraaPOS() {
 
   // Called by the camera scanner for each detected barcode; returns a status line to show on the scanner.
   function handleCameraScan(code) {
+    if (tab === 'catalog') {
+      // On the Catalog tab a scan just searches for that barcode.
+      setSearch(code);
+      setCameraOpen(false);
+      return { ok: true, text: `Searching ${code}` };
+    }
     const product = products.find((p) => p.barcode === code);
     if (!product) return { ok: false, text: `No suit found for ${code}` };
     const added = addProductToCart(product);
@@ -2582,13 +2613,30 @@ function AaraaPOS() {
               <div className="flex-1 flex items-center gap-2 rounded-xl px-3 py-2" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                 <Search size={16} color={COLORS.inkSoft} />
                 <input
+                  ref={catalogSearchRef}
                   value={search}
                   onChange={(e) => setSearch(e.target.value)}
-                  placeholder="Search by name, barcode, fabric"
+                  onFocus={(e) => e.target.select()}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === 'Tab') {
+                      // A scanner ends each code with Enter: keep the result, and select the text so the next scan replaces it.
+                      e.preventDefault();
+                      e.target.select();
+                    }
+                  }}
+                  placeholder="Scan, or search by name, barcode, fabric"
                   className="flex-1 outline-none bg-transparent text-sm"
                   style={{ color: COLORS.ink }}
                 />
+                {search && (
+                  <button type="button" onClick={() => { setSearch(''); catalogSearchRef.current && catalogSearchRef.current.focus(); }} aria-label="Clear search">
+                    <X size={16} color={COLORS.inkSoft} />
+                  </button>
+                )}
               </div>
+              <button onClick={() => setCameraOpen(true)} aria-label="Scan with camera" className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                <Scan size={18} color={COLORS.primary} />
+              </button>
               <button onClick={() => setPrintOpen(true)} className="w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                 <Printer size={18} color={COLORS.primary} />
               </button>
