@@ -157,6 +157,28 @@ function photoSettings() {
   return inClaude ? { maxW: 420, quality: 0.6, totalLimit: 200000 } : { maxW: 900, quality: 0.72, totalLimit: 1500000 };
 }
 
+// Small copy of a photo (about 260 px) for the catalog grid, so the list opens fast.
+function makeThumb(dataUrl, maxW = 260, quality = 0.6) {
+  return new Promise((resolve) => {
+    if (!dataUrl) return resolve(null);
+    const img = new Image();
+    img.onload = () => {
+      try {
+        const scale = Math.min(1, maxW / img.width);
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(img.width * scale));
+        c.height = Math.max(1, Math.round(img.height * scale));
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        resolve(c.toDataURL('image/jpeg', quality));
+      } catch (e) {
+        resolve(null);
+      }
+    };
+    img.onerror = () => resolve(null);
+    img.src = dataUrl;
+  });
+}
+
 function resizeImage(file, maxW = 500, quality = 0.7) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -827,6 +849,30 @@ const supa = (() => {
   let pending = 0; // writes in flight
   let writeSeq = 0; // bumped on every write, so a slow background refresh can't undo it
   const caches = {}; // collection -> Map(id -> { updated_at, data })
+  const saveTimers = {};
+  const CACHE_KEY = (n) => `aaraa_cloud_cache_${n}`;
+  // Keep a copy on this device, so the app opens instantly and only downloads what changed.
+  function persist(name) {
+    clearTimeout(saveTimers[name]);
+    saveTimers[name] = setTimeout(() => {
+      try {
+        localStore.set(CACHE_KEY(name), { email: (session && session.email) || '', entries: Array.from(cache(name).entries()) });
+      } catch (e) {}
+    }, 500);
+  }
+  async function hydrate() {
+    const out = { products: [], sales: [] };
+    for (const name of ['products', 'sales']) {
+      try {
+        const c = await localStore.get(CACHE_KEY(name));
+        if (c && c.email && session && c.email === session.email && Array.isArray(c.entries)) {
+          caches[name] = new Map(c.entries);
+          out[name] = Array.from(caches[name].values()).map((v) => v.data);
+        }
+      } catch (e) {}
+    }
+    return out;
+  }
 
   function cache(name) {
     if (!caches[name]) caches[name] = new Map();
@@ -903,6 +949,10 @@ const supa = (() => {
     session = null;
     saveSession();
     Object.keys(caches).forEach((k) => delete caches[k]);
+    ['products', 'sales'].forEach((n) => {
+      clearTimeout(saveTimers[n]);
+      try { localStore.set(CACHE_KEY(n), null); } catch (e) {}
+    });
   }
   async function rest(path, opts = {}) {
     if (!session) throw new Error('Not signed in');
@@ -949,17 +999,24 @@ const supa = (() => {
         changed = true;
       }
     }
-    for (let i = 0; i < need.length; i += 15) {
-      const chunk = need.slice(i, i + 15);
-      const inList = chunk.map((id) => `"${String(id).replace(/"/g, '\\"')}"`).join(',');
-      const rows = await rest(`pos_docs?collection=eq.${encodeURIComponent(name)}&id=in.(${encodeURIComponent(inList)})&select=id,updated_at,data`);
-      rows.forEach((r) => next.set(r.id, { updated_at: r.updated_at, data: r.data }));
+    const chunks = [];
+    for (let i = 0; i < need.length; i += 15) chunks.push(need.slice(i, i + 15));
+    for (let i = 0; i < chunks.length; i += 4) {
+      // up to 4 requests at a time
+      const results = await Promise.all(
+        chunks.slice(i, i + 4).map((chunk) => {
+          const inList = chunk.map((id) => `"${String(id).replace(/"/g, '\\"')}"`).join(',');
+          return rest(`pos_docs?collection=eq.${encodeURIComponent(name)}&id=in.(${encodeURIComponent(inList)})&select=id,updated_at,data`);
+        })
+      );
+      results.forEach((rows) => rows.forEach((r) => next.set(r.id, { updated_at: r.updated_at, data: r.data })));
     }
     for (const id of next.keys()) if (!next.get(id).data) next.delete(id);
     return { changed, next, list: Array.from(next.values()).map((v) => v.data) };
   }
   function commit(name, res) {
     caches[name] = res.next;
+    persist(name);
   }
   async function upsert(name, id, data) {
     pending++;
@@ -972,6 +1029,7 @@ const supa = (() => {
       });
       const r = rows && rows[0];
       cache(name).set(String(id), { updated_at: r ? r.updated_at : '', data });
+      persist(name);
     } finally {
       pending--;
       writeSeq++;
@@ -983,6 +1041,7 @@ const supa = (() => {
     try {
       await rest(`pos_docs?collection=eq.${encodeURIComponent(name)}&id=eq.${encodeURIComponent(String(id))}`, { method: 'DELETE' });
       cache(name).delete(String(id));
+      persist(name);
     } finally {
       pending--;
       writeSeq++;
@@ -1012,6 +1071,7 @@ const supa = (() => {
     signIn,
     restore,
     signOut,
+    hydrate,
     pull,
     commit,
     email: () => (session && session.email) || '',
@@ -1137,6 +1197,7 @@ function AaraaPOS() {
   const [toast, setToast] = useState('');
   const [search, setSearch] = useState('');
   const catalogSearchRef = useRef(null);
+  const [visibleCount, setVisibleCount] = useState(24); // catalog tiles drawn so far
   const [editing, setEditing] = useState(null); // product object, 'new', or null
   const [printOpen, setPrintOpen] = useState(false);
   const [printSelection, setPrintSelection] = useState({}); // barcode -> qty
@@ -1236,6 +1297,21 @@ function AaraaPOS() {
         try { setRole(await supa.role()); } catch (e) { setRole('staff'); }
       }
       dbRef.current = db;
+      if (db.isSupabase) {
+        // Show what this device already has straight away, then bring in only what changed.
+        const hy = await supa.hydrate();
+        if (hy.products.length || hy.sales.length) {
+          const lp = [...hy.products].sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+          const ls = [...hy.sales].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+          productsRef.current = lp;
+          salesRef.current = ls;
+          setProducts(lp);
+          setSales(ls);
+          setLoaded(true);
+          await loadData();
+          return;
+        }
+      }
       await loadData();
       setLoaded(true);
     })();
@@ -1449,6 +1525,10 @@ function AaraaPOS() {
       window.removeEventListener('keydown', onKey, true);
     };
   }, [tab, catalogBlocked]);
+
+  useEffect(() => {
+    setVisibleCount(24);
+  }, [search]);
 
   useEffect(() => {
     if (!toast) return;
@@ -1956,6 +2036,7 @@ function AaraaPOS() {
       dupattaFabric: form.dupattaFabric.trim(),
       handwork: form.handwork || [],
       image: form.image || null, // main photo (first of `images`) — used for thumbnails everywhere
+      thumb: (await makeThumb(form.image)) || undefined, // small copy for the catalog grid
       images: form.images || (form.image ? [form.image] : []),
       createdAt: isNew ? new Date().toISOString() : editing.createdAt,
     };
@@ -2691,10 +2772,10 @@ function AaraaPOS() {
               </div>
             ) : (
               <div className="grid grid-cols-2 gap-3">
-                {filteredProducts.map((p) => (
+                {filteredProducts.slice(0, visibleCount).map((p) => (
                   <button key={p.barcode} onClick={() => (isStaff ? setToast('Only the admin can edit or delete suits') : setEditing(p))} className="text-left rounded-xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                     <div className="w-full aspect-square relative" style={{ background: COLORS.chip }}>
-                      {p.image && <img src={p.image} alt={p.name} className="w-full h-full object-cover" />}
+                      {p.image && <img src={p.thumb || p.image} alt={p.name} loading="lazy" decoding="async" className="w-full h-full object-cover" />}
                       {p.image && (
                         <span
                           role="button"
@@ -2722,6 +2803,11 @@ function AaraaPOS() {
                   </button>
                 ))}
               </div>
+            )}
+            {filteredProducts.length > visibleCount && (
+              <button type="button" onClick={() => setVisibleCount((c) => c + 24)} className="w-full rounded-xl py-3 mt-4 text-sm font-medium" style={{ background: COLORS.chip, color: COLORS.primary }}>
+                Show more ({filteredProducts.length - visibleCount} left)
+              </button>
             )}
           </div>
         )}
