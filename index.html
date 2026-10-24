@@ -22,7 +22,7 @@
 </div>
 
 <script type="text/plain" id="app-source">
-  const { useState, useEffect, useRef, useCallback } = React;
+  const { useState, useEffect, useRef, useCallback, useMemo } = React;
 
 
     // ---- Minimal inline icon set (no external icon library needed) ----
@@ -35,6 +35,7 @@
     }
     function Scan(p) { return (<IconBase {...p}><path d="M3 7V4a1 1 0 0 1 1-1h3" /><path d="M17 3h3a1 1 0 0 1 1 1v3" /><path d="M21 17v3a1 1 0 0 1-1 1h-3" /><path d="M7 21H4a1 1 0 0 1-1-1v-3" /><line x1="4" y1="12" x2="20" y2="12" /></IconBase>); }
     function LayoutGrid(p) { return (<IconBase {...p}><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></IconBase>); }
+    function Wallet(p) { return (<IconBase {...p}><path d="M20 7H5a2 2 0 0 1 0-4h13v4" /><path d="M3 5v14a2 2 0 0 0 2 2h15V7" /><circle cx="16" cy="14" r="1.2" /></IconBase>); }
     function Receipt(p) { return (<IconBase {...p}><path d="M5 3h14v18l-2-1.3-2 1.3-2-1.3-2 1.3-2-1.3-2 1.3-2-1.3V3z" /><line x1="8" y1="8" x2="16" y2="8" /><line x1="8" y1="12" x2="16" y2="12" /><line x1="8" y1="16" x2="12" y2="16" /></IconBase>); }
     function Plus(p) { return (<IconBase {...p}><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></IconBase>); }
     function X(p) { return (<IconBase {...p}><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></IconBase>); }
@@ -133,7 +134,8 @@ function aggregateBillSplit(items) {
   const splits = items.map((s) => getPaymentSplit(s) || { cash: 0, online: 0, due: 0 });
   const first = splits[0];
   const hasAmount = Number(first.cash) > 0 || Number(first.online) > 0 || Number(first.due) > 0;
-  const allIdentical = splits.every(
+  const legacyBill = !items.every((s) => s.splitV === 2); // newer bills split each line properly, so equal lines are real
+  const allIdentical = legacyBill && splits.every(
     (sp) => Number(sp.cash) === Number(first.cash) && Number(sp.online) === Number(first.online) && Number(sp.due) === Number(first.due)
   );
   if (items.length > 1 && hasAmount && allIdentical) {
@@ -949,7 +951,7 @@ const supa = (() => {
     session = null;
     saveSession();
     Object.keys(caches).forEach((k) => delete caches[k]);
-    ['products', 'sales'].forEach((n) => {
+    ['products', 'sales', 'payments'].forEach((n) => {
       clearTimeout(saveTimers[n]);
       try { localStore.set(CACHE_KEY(n), null); } catch (e) {}
     });
@@ -1080,11 +1082,266 @@ const supa = (() => {
       return r === 'admin' ? 'admin' : 'staff';
     },
     nextInvoice: (fy) => rpc('pos_next_invoice', { fy }),
+    dues: () => rpc('pos_dues'),
     busy: () => pending > 0,
     seq: () => writeSeq,
   };
 })();
 
+
+// ---- Customer dues (pending payments) ----
+// Who a bill belongs to: the customer typed at sale time; for older bills, a name/number found in the note.
+function parseCustomerFromNote(note) {
+  const text = String(note || '').trim();
+  if (!text) return { name: '', mobile: '' };
+  const m = text.replace(/\+91[\s-]?/g, '').match(/\d[\d\s-]{8,}\d/);
+  let mobile = '';
+  let name = text;
+  if (m) {
+    const digits = m[0].replace(/\D/g, '');
+    if (digits.length >= 10) {
+      mobile = digits.slice(-10);
+      name = text.replace(/\+91[\s-]?/g, '').replace(m[0], ' ');
+    }
+  }
+  name = name.replace(/[,;:\-–]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return { name: name || (mobile ? '' : text), mobile };
+}
+
+function billCustomer(items) {
+  const withCustomer = items.find((x) => x.customer && (x.customer.name || x.customer.mobile));
+  let name = '';
+  let mobile = '';
+  if (withCustomer) {
+    name = String(withCustomer.customer.name || '').trim();
+    mobile = String(withCustomer.customer.mobile || '').replace(/\D/g, '').slice(-10);
+  } else {
+    const inv = (items.find((x) => x.invoice) || {}).invoice;
+    if (inv && (inv.customerName || inv.customerMobile)) {
+      name = String(inv.customerName || '').trim();
+      mobile = String(inv.customerMobile || '').replace(/\D/g, '').slice(-10);
+    } else {
+      const n = parseCustomerFromNote((items.find((x) => x.note) || {}).note);
+      name = n.name;
+      mobile = n.mobile;
+    }
+  }
+  const key = mobile ? `m:${mobile}` : `n:${(name || 'unknown').toLowerCase()}`;
+  return { key, name: name || (mobile ? '' : 'Unknown customer'), mobile };
+}
+
+// Pending amount for every customer: all their dues, minus every payment they have made since.
+// Payments are matched to the oldest bills first. Returns customers with something outstanding, biggest first.
+function buildDuesLedger(salesList, payments) {
+  const bills = new Map();
+  for (const s of salesList || []) {
+    const k = s.billId || s.id;
+    if (!bills.has(k)) bills.set(k, []);
+    bills.get(k).push(s);
+  }
+  const customers = new Map();
+  const get = (c) => {
+    if (!customers.has(c.key)) customers.set(c.key, { key: c.key, name: c.name, mobile: c.mobile, bills: [], payments: [], totalDue: 0, totalPaid: 0 });
+    const cur = customers.get(c.key);
+    if (!cur.name && c.name) cur.name = c.name;
+    if (!cur.mobile && c.mobile) cur.mobile = c.mobile;
+    return cur;
+  };
+  for (const [id, items] of bills) {
+    const split = aggregateBillSplit(items);
+    const due = Math.round((Number(split.due) || 0) * 100) / 100;
+    if (due <= 0) continue;
+    const cust = get(billCustomer(items));
+    cust.bills.push({
+      id,
+      date: items[0].timestamp,
+      items,
+      total: items.reduce((sum, x) => sum + (Number(x.total) || 0), 0),
+      due,
+      paid: 0,
+      pending: due,
+    });
+    cust.totalDue += due;
+  }
+  for (const p of payments || []) {
+    if (!p || !p.customerKey) continue;
+    const cust = get({ key: p.customerKey, name: p.customerName || '', mobile: p.customerMobile || '' });
+    cust.payments.push(p);
+    cust.totalPaid += (Number(p.cash) || 0) + (Number(p.online) || 0);
+  }
+  const out = [];
+  for (const c of customers.values()) {
+    c.bills.sort((a, b) => new Date(a.date) - new Date(b.date));
+    c.payments.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+    let left = c.totalPaid;
+    for (const b of c.bills) {
+      const alloc = Math.min(b.due, left);
+      b.paid = alloc;
+      b.pending = Math.round((b.due - alloc) * 100) / 100;
+      left -= alloc;
+    }
+    c.outstanding = Math.round((c.totalDue - c.totalPaid) * 100) / 100;
+    c.oldest = c.bills.find((b) => b.pending > 0) ? c.bills.find((b) => b.pending > 0).date : null;
+    c.displayName = c.name || (c.mobile ? c.mobile : 'Unknown customer');
+    if (c.outstanding > 0) out.push(c);
+  }
+  out.sort((a, b) => b.outstanding - a.outstanding);
+  return out;
+}
+
+function formatDay(ts) {
+  return new Date(ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+}
+
+// One customer's pending bills and payments, with a button to record a payment.
+function CustomerDuesModal({ customer, onClose, onReceive }) {
+  const waText = encodeURIComponent(`Hello ${customer.name || ''}, a gentle reminder from Aaraa Creation: ₹${customer.outstanding} is pending. Kindly pay at your convenience. Thank you!`);
+  return (
+    <div className="fixed inset-0 flex items-end justify-center z-10" style={{ background: 'rgba(43,36,30,0.5)' }}>
+      <div className="w-full rounded-t-2xl overflow-y-auto" style={{ background: COLORS.bg, maxHeight: '88vh' }}>
+        <div className="flex items-center justify-between px-5 pt-5 pb-2">
+          <div className="min-w-0">
+            <div className="text-lg font-semibold truncate" style={{ color: COLORS.ink }}>{customer.displayName}</div>
+            {customer.mobile && customer.name && <div className="text-xs" style={{ color: COLORS.inkSoft }}>{customer.mobile}</div>}
+          </div>
+          <button onClick={onClose}><X size={20} color={COLORS.inkSoft} /></button>
+        </div>
+        <div className="px-5 pb-5">
+          <div className="rounded-xl p-4 mb-3" style={{ background: COLORS.primary }}>
+            <div className="text-xs" style={{ color: '#F0D9E4' }}>Outstanding</div>
+            <div className="text-2xl font-semibold text-white">{formatINR(customer.outstanding)}</div>
+            <div className="text-xs" style={{ color: '#F0D9E4' }}>
+              Total due {formatINR(customer.totalDue)}{customer.totalPaid > 0 ? ` · paid so far ${formatINR(customer.totalPaid)}` : ''}
+            </div>
+          </div>
+          <button type="button" onClick={onReceive} className="w-full rounded-xl py-3 font-medium text-white mb-2" style={{ background: COLORS.teal }}>
+            Receive payment
+          </button>
+          {customer.mobile && (
+            <div className="grid grid-cols-2 gap-2 mb-3">
+              <a href={`tel:${customer.mobile}`} className="rounded-xl py-2 text-sm text-center font-medium" style={{ background: COLORS.chip, color: COLORS.primary }}>Call</a>
+              <a href={`https://wa.me/91${customer.mobile}?text=${waText}`} target="_blank" rel="noreferrer" className="rounded-xl py-2 text-sm text-center font-medium" style={{ background: COLORS.chip, color: COLORS.primary }}>WhatsApp reminder</a>
+            </div>
+          )}
+          <div className="text-xs mb-1 mt-2" style={{ color: COLORS.inkSoft }}>Pending bills</div>
+          <div className="space-y-2 mb-3">
+            {customer.bills.map((b) => (
+              <div key={b.id} className="rounded-lg p-3" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                <div className="flex items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <div className="text-sm font-medium truncate" style={{ color: COLORS.ink }}>
+                      {b.items.length === 1 ? b.items[0].name : `${b.items[0].name} + ${b.items.length - 1} more`}
+                    </div>
+                    <div className="text-xs" style={{ color: COLORS.inkSoft }}>{formatDay(b.date)} · bill {formatINR(b.total)}</div>
+                  </div>
+                  <div className="text-right flex-shrink-0">
+                    {b.pending > 0 ? (
+                      <div className="text-sm font-medium" style={{ color: COLORS.rust }}>{formatINR(b.pending)} due</div>
+                    ) : (
+                      <div className="text-sm font-medium" style={{ color: COLORS.teal }}>Cleared</div>
+                    )}
+                    {b.paid > 0 && b.pending > 0 && <div className="text-xs" style={{ color: COLORS.inkSoft }}>of {formatINR(b.due)}</div>}
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+          {customer.payments.length > 0 && (
+            <>
+              <div className="text-xs mb-1" style={{ color: COLORS.inkSoft }}>Payments received</div>
+              <div className="space-y-2 mb-3">
+                {customer.payments.map((p) => (
+                  <div key={p.id} className="rounded-lg p-3 flex items-center justify-between" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                    <div>
+                      <div className="text-sm font-medium" style={{ color: COLORS.teal }}>{formatINR((Number(p.cash) || 0) + (Number(p.online) || 0))}</div>
+                      <div className="text-xs" style={{ color: COLORS.inkSoft }}>
+                        {formatDay(p.timestamp)} · {paymentSplitText({ cash: p.cash, online: p.online })}
+                        {p.note ? ` · ${p.note}` : ''}
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+          <button type="button" onClick={onClose} className="w-full rounded-xl py-3 font-medium" style={{ background: COLORS.chip, color: COLORS.primary }}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Same Cash / Online / Due choices as a sale: whatever is paid now, and what stays pending.
+function ReceivePaymentModal({ customer, onClose, onConfirm }) {
+  const owed = customer.outstanding;
+  const [cash, setCash] = useState('');
+  const [online, setOnline] = useState('');
+  const [due, setDue] = useState('');
+  const [note, setNote] = useState('');
+  const [busy, setBusy] = useState(false);
+  const assigned = (Number(cash) || 0) + (Number(online) || 0) + (Number(due) || 0);
+  const received = (Number(cash) || 0) + (Number(online) || 0);
+  const matches = Math.abs(assigned - owed) < 0.005;
+  const ok = matches && received > 0 && !busy;
+  const quick = (c, o, d) => { setCash(String(c)); setOnline(String(o)); setDue(String(d)); };
+  const chipStyle = { background: COLORS.card, color: COLORS.inkSoft, border: `1px solid ${COLORS.border}` };
+  return (
+    <div className="fixed inset-0 flex items-end justify-center z-20" style={{ background: 'rgba(43,36,30,0.6)' }}>
+      <div className="w-full rounded-t-2xl overflow-y-auto" style={{ background: COLORS.bg, maxHeight: '90vh' }}>
+        <div className="flex items-center justify-between px-5 pt-5 pb-2">
+          <div>
+            <div className="text-lg font-semibold" style={{ color: COLORS.ink }}>Receive payment</div>
+            <div className="text-xs" style={{ color: COLORS.inkSoft }}>{customer.displayName} · outstanding {formatINR(owed)}</div>
+          </div>
+          <button onClick={onClose}><X size={20} color={COLORS.inkSoft} /></button>
+        </div>
+        <div className="px-5 pb-5">
+          <div className="text-xs mb-1 px-1" style={{ color: COLORS.inkSoft }}>How was it paid? Split across modes if needed</div>
+          <div className="flex gap-2 mb-2">
+            <button type="button" onClick={() => quick(owed, 0, 0)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Cash</button>
+            <button type="button" onClick={() => quick(0, owed, 0)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Online</button>
+            <button type="button" onClick={() => quick(0, 0, owed)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Due</button>
+          </div>
+          <div className="grid grid-cols-3 gap-2">
+            <Field label="Cash ₹">
+              <input type="number" inputMode="decimal" value={cash} onChange={(e) => setCash(e.target.value)} placeholder="0" className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+            </Field>
+            <Field label="Online ₹">
+              <input type="number" inputMode="decimal" value={online} onChange={(e) => setOnline(e.target.value)} placeholder="0" className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+            </Field>
+            <Field label="Due ₹">
+              <input type="number" inputMode="decimal" value={due} onChange={(e) => setDue(e.target.value)} placeholder="0" className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+            </Field>
+          </div>
+          <div className="text-xs mt-1 px-1" style={{ color: matches ? COLORS.teal : COLORS.rust }}>
+            {matches
+              ? received > 0
+                ? `Receiving ${formatINR(received)} · ${formatINR(Number(due) || 0)} stays pending`
+                : 'Enter the cash or online amount received'
+              : `Assigned ${formatINR(assigned)} of ${formatINR(owed)} — ${assigned < owed ? `${formatINR(owed - assigned)} unassigned` : `${formatINR(assigned - owed)} over`}`}
+          </div>
+          <div className="mt-3 rounded-xl px-3 py-2" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+            <div className="text-xs mb-0.5" style={{ color: COLORS.inkSoft }}>Note (optional)</div>
+            <input value={note} onChange={(e) => setNote(e.target.value)} className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+          </div>
+          <button
+            type="button"
+            disabled={!ok}
+            onClick={async () => {
+              setBusy(true);
+              const r = await onConfirm({ cash: Number(cash) || 0, online: Number(online) || 0, note: note.trim() });
+              if (!r) setBusy(false);
+            }}
+            className="w-full rounded-xl py-3 mt-4 font-medium text-white"
+            style={{ background: COLORS.teal, opacity: ok ? 1 : 0.5 }}
+          >
+            {busy ? 'Saving…' : `Record ${formatINR(received)} received`}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
 
 // Full-screen photo viewer: swipe/tap thumbnails to change photo, tap the photo to zoom in and drag to look around.
 function PhotoViewer({ product, onClose }) {
@@ -1235,6 +1492,12 @@ function AaraaPOS() {
   const dbRef = useRef(null); // Claude's shared storage, once resolved
   const productsRef = useRef([]); // mirrors `products`, for diffing writes without stale closures
   const salesRef = useRef([]); // mirrors `sales`, same reason
+  const [payments, setPayments] = useState([]); // payments received against dues
+  const paymentsRef = useRef([]);
+  const [duesData, setDuesData] = useState({ sales: [], payments: [] }); // shared database: every pending bill + payment (staff only see today's sales otherwise)
+  const [duesOpenKey, setDuesOpenKey] = useState(null); // customer whose dues are open
+  const [receiveKey, setReceiveKey] = useState(null); // customer a payment is being recorded for
+  const [duesSearch, setDuesSearch] = useState('');
 
   useEffect(() => {
     productsRef.current = products;
@@ -1245,11 +1508,26 @@ function AaraaPOS() {
   }, [sales]);
 
   useEffect(() => {
+    paymentsRef.current = payments;
+  }, [payments]);
+
+  useEffect(() => {
     if (printRequested) {
       window.print();
       setPrintRequested(false);
     }
   }, [printRequested]);
+
+  // Shared database: staff only receive today's sales, so pending bills + payments come from a dedicated call.
+  const refreshDues = useCallback(async () => {
+    if (!supa.email()) return;
+    try {
+      const d = await supa.dues();
+      setDuesData({ sales: (d && d.sales) || [], payments: (d && d.payments) || [] });
+    } catch (e) {
+      console.error('dues refresh failed', e);
+    }
+  }, []);
 
   const loadData = useCallback(async () => {
     const db = dbRef.current;
@@ -1260,6 +1538,8 @@ function AaraaPOS() {
       setProducts(Array.isArray(savedP) ? savedP : []);
       const savedS = await localStore.get('aaraa_sales');
       setSales(Array.isArray(savedS) ? savedS : []);
+      const savedPay = await localStore.get('aaraa_payments');
+      setPayments(Array.isArray(savedPay) ? savedPay : []);
       return;
     }
     try {
@@ -1278,7 +1558,17 @@ function AaraaPOS() {
     } catch (e) {
       console.error('load sales failed', e);
     }
-  }, []);
+    try {
+      const snap = await db.collection('payments').get();
+      const list = snap.docs.map((d) => d.data());
+      list.sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+      paymentsRef.current = list;
+      setPayments(list);
+    } catch (e) {
+      console.error('load payments failed', e);
+    }
+    if (db.isSupabase) await refreshDues();
+  }, [refreshDues]);
 
   useEffect(() => {
     (async () => {
@@ -1347,7 +1637,7 @@ function AaraaPOS() {
     if (!supa.email() || supa.busy()) return;
     const seq = supa.seq();
     try {
-      const [p, s] = await Promise.all([supa.pull('products'), supa.pull('sales')]);
+      const [p, s, pay] = await Promise.all([supa.pull('products'), supa.pull('sales'), supa.pull('payments')]);
       if (supa.busy() || seq !== supa.seq()) return; // a save happened meanwhile; try again next time
       if (p.changed) {
         supa.commit('products', p);
@@ -1361,10 +1651,17 @@ function AaraaPOS() {
         salesRef.current = list;
         setSales(list);
       }
+      if (pay.changed) {
+        supa.commit('payments', pay);
+        const list = [...pay.list].sort((a, b) => (b.timestamp || '').localeCompare(a.timestamp || ''));
+        paymentsRef.current = list;
+        setPayments(list);
+      }
+      await refreshDues();
     } catch (e) {
       console.error('background refresh failed', e);
     }
-  }, []);
+  }, [refreshDues]);
 
   useEffect(() => {
     if (!cloud) return;
@@ -1597,6 +1894,52 @@ function AaraaPOS() {
     }
   }, []);
 
+  const persistPayments = useCallback(async (next) => {
+    const prev = paymentsRef.current;
+    setPayments(next);
+    paymentsRef.current = next;
+    const db = dbRef.current;
+    if (!db) {
+      return await localStore.set('aaraa_payments', next);
+    }
+    try {
+      await syncCollection(db, 'payments', prev, next, 'id');
+      return true;
+    } catch (e) {
+      console.error('save payments failed', e);
+      return false;
+    }
+  }, []);
+
+  // Everyone with a pending amount. On the shared database this comes from the dues call (all days);
+  // otherwise it is worked out from this device's own sales and payments.
+  const duesCustomers = useMemo(
+    () => buildDuesLedger(cloud ? duesData.sales : sales, cloud ? duesData.payments : payments),
+    [cloud, duesData, sales, payments]
+  );
+
+  async function receivePayment(customer, { cash, online, note }) {
+    const doc = {
+      id: `pay-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
+      timestamp: new Date().toISOString(),
+      customerKey: customer.key,
+      customerName: customer.name || '',
+      customerMobile: customer.mobile || '',
+      cash,
+      online,
+      note: note || null,
+    };
+    const ok = await persistPayments([doc, ...paymentsRef.current]);
+    if (!ok) {
+      setToast('Could not save the payment — please try again');
+      return false;
+    }
+    if (cloud) await refreshDues();
+    setReceiveKey(null);
+    setToast(`Received ${formatINR(cash + online)} from ${customer.displayName}`);
+    return true;
+  }
+
   async function updateSaleRecord(original, updated) {
     const qty = Math.max(0, Number(updated.qty) || 0);
     const price = Math.max(0, Number(updated.price) || 0);
@@ -1754,6 +2097,11 @@ function AaraaPOS() {
   const custMobileClean = custMobile.replace(/\D/g, '').replace(/^91(?=\d{10}$)/, '');
   const partlyOnline = needsInvoice && (Number(payCash) || 0) + (Number(payDue) || 0) > 0;
   const invoiceMissing = needsInvoice && (!custName.trim() || custMobileClean.length !== 10 || (partlyOnline && !invoiceBasis));
+  const dueAmount = Number(payDue) || 0;
+  // A pending (due) amount must be tied to a customer, so it can be tracked and collected later.
+  const customerMissing = dueAmount > 0 && (!custName.trim() || custMobileClean.length !== 10);
+  const showCustomerBox = needsInvoice || dueAmount > 0;
+  const knownDues = custMobileClean.length === 10 ? duesCustomers.find((c) => c.mobile === custMobileClean) : null;
 
   function holdCurrentCart() {
     if (cart.length === 0) return;
@@ -1815,8 +2163,8 @@ function AaraaPOS() {
       );
       return;
     }
-    if ((Number(payDue) || 0) > 0 && !saleNote.trim()) {
-      setScanError('Add the customer\'s name and phone number in the Note field before completing a sale with a due amount');
+    if (customerMissing) {
+      setScanError('A due amount needs the customer\'s name and a 10-digit mobile number');
       return;
     }
     if (invoiceMissing) {
@@ -1902,6 +2250,8 @@ function AaraaPOS() {
         note: note || null,
         paymentSplit: { cash: lineCash, online: lineOnline, due: lineDue },
         invoice: invoiceMeta,
+        customer: showCustomerBox && custName.trim() ? { name: custName.trim(), mobile: custMobileClean } : undefined,
+        splitV: 2,
       };
     });
     const recordedTotal = cartTotal;
@@ -1929,6 +2279,7 @@ function AaraaPOS() {
     setInvoiceBasis('');
     setToast(`Sale recorded — ${formatINR(recordedTotal)}`);
     setSaleInProgress(false);
+    if (cloud && dueAmount > 0) refreshDues();
     if (invoiceMeta) setInvoiceItems(newSales); // show the invoice right away
   }
 
@@ -1944,6 +2295,7 @@ function AaraaPOS() {
       exportedAt: new Date().toISOString(),
       products: productsRef.current,
       sales: salesRef.current,
+      payments: paymentsRef.current,
     });
     const filename = `aaraa-backup-${new Date().toISOString().slice(0, 10)}.json`;
     try {
@@ -1990,6 +2342,9 @@ function AaraaPOS() {
       const newProducts = data.products.filter((p) => p && p.barcode && !haveBarcodes.has(p.barcode));
       const haveSales = new Set(salesRef.current.map((x) => x.id));
       const newSales = data.sales.filter((x) => x && x.id != null && !haveSales.has(x.id));
+      const havePay = new Set(paymentsRef.current.map((x) => x.id));
+      const newPay = (Array.isArray(data.payments) ? data.payments : []).filter((x) => x && x.id != null && !havePay.has(x.id));
+      if (newPay.length) await persistPayments([...newPay, ...paymentsRef.current]);
       if (newProducts.length) await persistProducts([...newProducts, ...productsRef.current]);
       if (newSales.length) {
         const merged = [...salesRef.current, ...newSales].sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
@@ -2005,7 +2360,7 @@ function AaraaPOS() {
   }
 
   function backupPayload() {
-    return JSON.stringify({ app: 'aaraa-pos', version: 1, exportedAt: new Date().toISOString(), products: productsRef.current, sales: salesRef.current });
+    return JSON.stringify({ app: 'aaraa-pos', version: 1, exportedAt: new Date().toISOString(), products: productsRef.current, sales: salesRef.current, payments: paymentsRef.current });
   }
 
   async function copyBackupText() {
@@ -2207,7 +2562,10 @@ function AaraaPOS() {
       return map;
     }, new Map())
   ).map(([, items]) => items);
-  const todaysReceived = todaysBillGroups.reduce((sum, items) => {
+  const todaysPayments = payments.filter((x) => new Date(x.timestamp).toDateString() === new Date().toDateString());
+  const todaysPaymentCash = todaysPayments.reduce((sum, x) => sum + (Number(x.cash) || 0), 0);
+  const todaysPaymentOnline = todaysPayments.reduce((sum, x) => sum + (Number(x.online) || 0), 0);
+  const todaysReceived = todaysPaymentCash + todaysPaymentOnline + todaysBillGroups.reduce((sum, items) => {
     const sp = aggregateBillSplit(items);
     return sum + sp.cash + sp.online;
   }, 0);
@@ -2249,6 +2607,8 @@ function AaraaPOS() {
       { cash: 0, online: 0, due: 0 }
     );
   const todayTotals = sumSplits(todaysBillGroups);
+  todayTotals.cash += todaysPaymentCash; // money collected against old dues counts as received today
+  todayTotals.online += todaysPaymentOnline;
 
   if (needLogin) return <LoginScreen onLogin={handleLogin} />;
 
@@ -2274,11 +2634,11 @@ function AaraaPOS() {
         <div>
           <img src={LOGO_DATA_URI} alt="Aaraa Creation" style={{ height: '28px', width: 'auto', display: 'block', marginBottom: '4px' }} />
           <div className="text-xl font-semibold" style={{ color: COLORS.ink }}>
-            {tab === 'sell' ? 'Sell' : tab === 'catalog' ? 'Catalog' : 'Sales history'}
+            {tab === 'sell' ? 'Sell' : tab === 'catalog' ? 'Catalog' : tab === 'dues' ? 'Dues' : 'Sales history'}
           </div>
         </div>
         <div className="flex items-center gap-3">
-          {(tab === 'sell' || tab === 'catalog') && (
+          {(tab === 'sell' || tab === 'catalog' || tab === 'dues') && (
             <button onClick={handleRefresh} className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0" style={{ background: COLORS.chip }}>
               <RefreshCw size={14} color={COLORS.primary} className={refreshing ? 'animate-spin' : ''} />
             </button>
@@ -2620,10 +2980,14 @@ function AaraaPOS() {
               </div>
             )}
 
-            {cart.length > 0 && needsInvoice && (
-              <div className="mt-3 rounded-xl p-3" style={{ background: COLORS.card, border: `1px solid ${invoiceMissing ? COLORS.rust : COLORS.border}` }}>
-                <div className="text-xs mb-2" style={{ color: invoiceMissing ? COLORS.rust : COLORS.inkSoft }}>
-                  Online payment — invoice details (required)
+            {cart.length > 0 && showCustomerBox && (
+              <div className="mt-3 rounded-xl p-3" style={{ background: COLORS.card, border: `1px solid ${invoiceMissing || customerMissing ? COLORS.rust : COLORS.border}` }}>
+                <div className="text-xs mb-2" style={{ color: invoiceMissing || customerMissing ? COLORS.rust : COLORS.inkSoft }}>
+                  {needsInvoice && dueAmount > 0
+                    ? 'Online payment and due amount — customer details (required)'
+                    : needsInvoice
+                    ? 'Online payment — invoice details (required)'
+                    : 'Due amount — customer details (required)'}
                 </div>
                 <div className="grid grid-cols-2 gap-2">
                   <Field label="Customer name">
@@ -2633,6 +2997,12 @@ function AaraaPOS() {
                     <input type="tel" inputMode="numeric" value={custMobile} onChange={(e) => setCustMobile(e.target.value)} placeholder="10 digits" className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
                   </Field>
                 </div>
+                {knownDues && (
+                  <div className="mt-3 rounded-lg px-3 py-2 text-xs flex items-center justify-between gap-2" style={{ background: '#F5E4DD', color: COLORS.rust }}>
+                    <span>{knownDues.displayName} already has {formatINR(knownDues.outstanding)} pending</span>
+                    <button type="button" onClick={() => { setTab('dues'); setDuesOpenKey(knownDues.key); }} className="underline font-medium">View</button>
+                  </div>
+                )}
                 {partlyOnline && (
                   <div className="mt-3">
                     <div className="text-xs mb-1" style={{ color: !invoiceBasis ? COLORS.rust : COLORS.inkSoft }}>
@@ -2665,20 +3035,20 @@ function AaraaPOS() {
             )}
 
             {cart.length > 0 && (() => {
-              const noteRequired = (Number(payDue) || 0) > 0;
-              const noteMissing = noteRequired && !saleNote.trim();
+              const noteRequired = false;
+              const noteMissing = false;
               return (
                 <div
                   className="mt-3 rounded-xl px-3 py-2"
                   style={{ background: COLORS.card, border: `1px solid ${noteMissing ? COLORS.rust : COLORS.border}` }}
                 >
                   <div className="text-xs mb-0.5" style={{ color: noteMissing ? COLORS.rust : COLORS.inkSoft }}>
-                    {noteRequired ? 'Note — required: customer name & phone number (due amount entered)' : 'Note (optional) — customer name, phone, discount reason, etc.'}
+                    Note (optional) — discount reason, etc.
                   </div>
                   <input
                     value={saleNote}
                     onChange={(e) => setSaleNote(e.target.value)}
-                    placeholder="e.g. Fatima, 98765xxxxx"
+                    placeholder="e.g. special discount for repeat customer"
                     className="w-full outline-none bg-transparent text-sm"
                     style={{ color: COLORS.ink }}
                   />
@@ -2812,6 +3182,48 @@ function AaraaPOS() {
           </div>
         )}
 
+        {tab === 'dues' && (
+          <div className="px-5 pt-4">
+            {!isStaff && duesCustomers.length > 0 && (
+              <div className="rounded-xl p-4 mb-4" style={{ background: COLORS.primary }}>
+                <div className="text-xs" style={{ color: '#F0D9E4' }}>Total outstanding</div>
+                <div className="text-2xl font-semibold text-white">{formatINR(duesCustomers.reduce((sum, c) => sum + c.outstanding, 0))}</div>
+                <div className="text-xs" style={{ color: '#F0D9E4' }}>{duesCustomers.length} customer{duesCustomers.length === 1 ? '' : 's'} pending</div>
+              </div>
+            )}
+            <div className="flex items-center gap-2 rounded-xl px-3 py-2 mb-4" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+              <Search size={16} color={COLORS.inkSoft} />
+              <input value={duesSearch} onChange={(e) => setDuesSearch(e.target.value)} placeholder="Search customer name or mobile" className="flex-1 outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+            </div>
+            {(() => {
+              const q = duesSearch.trim().toLowerCase();
+              const list = q ? duesCustomers.filter((c) => c.displayName.toLowerCase().includes(q) || (c.mobile || '').includes(q)) : duesCustomers;
+              if (list.length === 0) {
+                return (
+                  <div className="text-center py-16 text-sm" style={{ color: COLORS.inkSoft }}>
+                    {duesCustomers.length === 0 ? 'No pending payments. 🎉' : 'No matching customer.'}
+                  </div>
+                );
+              }
+              return (
+                <div className="space-y-2">
+                  {list.map((c) => (
+                    <button key={c.key} type="button" onClick={() => setDuesOpenKey(c.key)} className="w-full flex items-center justify-between gap-3 rounded-lg p-3 text-left" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium truncate" style={{ color: COLORS.ink }}>{c.displayName}</div>
+                        <div className="text-xs" style={{ color: COLORS.inkSoft }}>
+                          {c.name && c.mobile ? `${c.mobile} · ` : ''}{c.bills.filter((b) => b.pending > 0).length} bill{c.bills.filter((b) => b.pending > 0).length === 1 ? '' : 's'}{c.oldest ? ` · since ${formatDay(c.oldest)}` : ''}
+                        </div>
+                      </div>
+                      <div className="text-sm font-semibold flex-shrink-0" style={{ color: COLORS.rust }}>{formatINR(c.outstanding)}</div>
+                    </button>
+                  ))}
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
         {tab === 'history' && (
           <div className="px-5 pt-4">
             {!isStaff && (<>
@@ -2844,6 +3256,24 @@ function AaraaPOS() {
             {isStaff && (
               <div className="text-xs mb-3" style={{ color: COLORS.inkSoft }}>Showing today's bills only.</div>
             )}
+            {todaysPayments.length > 0 && (
+              <div className="mb-5">
+                <div className="text-xs font-medium mb-2" style={{ color: COLORS.inkSoft }}>Payments received today (against dues)</div>
+                <div className="space-y-2">
+                  {todaysPayments.map((x) => (
+                    <div key={x.id} className="rounded-lg p-3 flex items-center justify-between gap-2" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                      <div className="min-w-0">
+                        <div className="text-sm font-medium truncate" style={{ color: COLORS.ink }}>{x.customerName || x.customerMobile || 'Customer'}</div>
+                        <div className="text-xs" style={{ color: COLORS.inkSoft }}>
+                          {new Date(x.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })} · {paymentSplitText({ cash: x.cash, online: x.online })}
+                        </div>
+                      </div>
+                      <div className="text-sm font-medium flex-shrink-0" style={{ color: COLORS.teal }}>{formatINR((Number(x.cash) || 0) + (Number(x.online) || 0))}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
             {sales.length === 0 ? (
               <div className="text-center py-16" style={{ color: COLORS.inkSoft }}>
                 <div className="text-sm">No sales recorded yet.</div>
@@ -2855,6 +3285,7 @@ function AaraaPOS() {
                     <div className="text-xs font-medium" style={{ color: COLORS.inkSoft }}>{day}</div>
                     {!isStaff && (() => {
                       const t = sumSplits(bills);
+                      payments.filter((x) => formatDay(x.timestamp) === day).forEach((x) => { t.cash += Number(x.cash) || 0; t.online += Number(x.online) || 0; });
                       return (
                         <div className="text-xs" style={{ color: COLORS.inkSoft }}>
                           Cash {formatINR(t.cash)} · Online {formatINR(t.online)} · Due {formatINR(t.due)}
@@ -2959,11 +3390,11 @@ function AaraaPOS() {
         <div className="absolute bottom-16 left-0 right-0 px-5 pb-2">
           <button
             onClick={completeSale}
-            disabled={saleInProgress || paymentAssigned !== cartTotal || invoiceMissing || ((Number(payDue) || 0) > 0 && !saleNote.trim())}
+            disabled={saleInProgress || paymentAssigned !== cartTotal || invoiceMissing || customerMissing}
             className="w-full rounded-xl py-3 flex items-center justify-between px-4 shadow-lg"
             style={{
               background: COLORS.primary,
-              opacity: saleInProgress || paymentAssigned !== cartTotal || invoiceMissing || ((Number(payDue) || 0) > 0 && !saleNote.trim()) ? 0.5 : 1,
+              opacity: saleInProgress || paymentAssigned !== cartTotal || invoiceMissing || customerMissing ? 0.5 : 1,
             }}
           >
             <span className="text-white font-medium">{saleInProgress ? 'Recording…' : 'Complete sale'}</span>
@@ -2976,10 +3407,16 @@ function AaraaPOS() {
         {[
           { key: 'sell', label: 'Sell', icon: Scan },
           { key: 'catalog', label: 'Catalog', icon: LayoutGrid },
+          { key: 'dues', label: 'Dues', icon: Wallet, badge: duesCustomers.length },
           { key: 'history', label: 'History', icon: Receipt },
-        ].map(({ key, label, icon: Icon }) => (
+        ].map(({ key, label, icon: Icon, badge }) => (
           <button key={key} onClick={() => setTab(key)} className="flex-1 flex flex-col items-center gap-1 py-2.5">
-            <Icon size={20} color={tab === key ? COLORS.primary : COLORS.inkSoft} />
+            <span className="relative">
+              <Icon size={20} color={tab === key ? COLORS.primary : COLORS.inkSoft} />
+              {badge > 0 && (
+                <span className="absolute flex items-center justify-center rounded-full text-white" style={{ top: -6, right: -10, minWidth: 16, height: 16, fontSize: 10, padding: '0 4px', background: COLORS.rust }}>{badge}</span>
+              )}
+            </span>
             <span className="text-xs" style={{ color: tab === key ? COLORS.primary : COLORS.inkSoft }}>{label}</span>
           </button>
         ))}
@@ -3019,6 +3456,20 @@ function AaraaPOS() {
         />
       )}
 
+      {duesOpenKey && duesCustomers.find((c) => c.key === duesOpenKey) && (
+        <CustomerDuesModal
+          customer={duesCustomers.find((c) => c.key === duesOpenKey)}
+          onClose={() => setDuesOpenKey(null)}
+          onReceive={() => setReceiveKey(duesOpenKey)}
+        />
+      )}
+      {receiveKey && duesCustomers.find((c) => c.key === receiveKey) && (
+        <ReceivePaymentModal
+          customer={duesCustomers.find((c) => c.key === receiveKey)}
+          onClose={() => setReceiveKey(null)}
+          onConfirm={(v) => receivePayment(duesCustomers.find((c) => c.key === receiveKey), v)}
+        />
+      )}
       {viewPhoto && <PhotoViewer product={products.find((x) => x.barcode === viewPhoto.barcode) || viewPhoto} onClose={() => { setViewPhoto(null); setTimeout(() => scanRef.current && scanRef.current.focus(), 60); }} />}
       {invoiceItems && <InvoiceModal items={invoiceItems} onClose={() => setInvoiceItems(null)} />}
 
