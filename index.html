@@ -1189,6 +1189,21 @@ function buildDuesLedger(salesList, payments) {
   return out;
 }
 
+// Today as YYYY-MM-DD in the device's own time zone (what a date input expects).
+function todayInputValue() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+// The moment to stamp on a sale: now, or the chosen earlier day at the current time of day.
+function saleTimestamp(dateStr) {
+  const now = new Date();
+  if (!dateStr || dateStr === todayInputValue()) return now.toISOString();
+  const [y, m, d] = dateStr.split('-').map(Number);
+  if (!y || !m || !d) return now.toISOString();
+  const when = new Date(y, m - 1, d, now.getHours(), now.getMinutes(), now.getSeconds());
+  return when > now ? now.toISOString() : when.toISOString();
+}
+
 function formatDay(ts) {
   return new Date(ts).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
@@ -1444,6 +1459,7 @@ function AaraaPOS() {
   const [payCash, setPayCash] = useState('');
   const [custName, setCustName] = useState('');
   const [custMobile, setCustMobile] = useState('');
+  const [saleDate, setSaleDate] = useState(''); // '' = today; admin can pick an earlier day for a sale recorded late
   const [invoiceBasis, setInvoiceBasis] = useState(''); // '' | 'full' | 'online' — asked when payment is part online, part cash/due
   const [invoiceItems, setInvoiceItems] = useState(null); // sale lines of the bill whose invoice is open
   const [finalOverride, setFinalOverride] = useState(''); // bargained final amount for the bill (empty = no change)
@@ -1510,6 +1526,10 @@ function AaraaPOS() {
   useEffect(() => {
     paymentsRef.current = payments;
   }, [payments]);
+
+  useEffect(() => {
+    if (cart.length === 0) setSaleDate(''); // a new bill starts on today's date
+  }, [cart.length]);
 
   useEffect(() => {
     if (printRequested) {
@@ -2194,7 +2214,7 @@ function AaraaPOS() {
       return;
     }
 
-    const now = new Date().toISOString();
+    const now = saleTimestamp(isStaff ? '' : saleDate);
     const note = saleNote.trim();
     const billId = `bill-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
     const billSplit = {
@@ -2277,6 +2297,7 @@ function AaraaPOS() {
     setCustName('');
     setCustMobile('');
     setInvoiceBasis('');
+    setSaleDate('');
     setToast(`Sale recorded — ${formatINR(recordedTotal)}`);
     setSaleInProgress(false);
     if (cloud && dueAmount > 0) refreshDues();
@@ -2922,6 +2943,26 @@ function AaraaPOS() {
 
             {cart.length > 0 && (
               <div className="mt-3">
+                <div className="flex items-center justify-between gap-2 mb-3 rounded-xl px-3 py-2" style={{ background: COLORS.card, border: `1px solid ${saleDate && saleDate !== todayInputValue() ? COLORS.gold : COLORS.border}` }}>
+                  <div className="text-xs" style={{ color: COLORS.inkSoft }}>
+                    Sale date
+                    {saleDate && saleDate !== todayInputValue() && <span style={{ color: COLORS.gold }}> · not today</span>}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="date"
+                      value={saleDate || todayInputValue()}
+                      max={todayInputValue()}
+                      disabled={isStaff}
+                      onChange={(e) => setSaleDate(e.target.value && e.target.value !== todayInputValue() ? e.target.value : '')}
+                      className="outline-none bg-transparent text-sm"
+                      style={{ color: COLORS.ink }}
+                    />
+                    {saleDate && !isStaff && (
+                      <button type="button" onClick={() => setSaleDate('')} className="text-xs underline" style={{ color: COLORS.primary }}>Today</button>
+                    )}
+                  </div>
+                </div>
                 <div className="text-xs mb-1 px-1" style={{ color: COLORS.inkSoft }}>Payment — split across modes if needed</div>
                 <div className="flex gap-2 mb-2">
                   <button
