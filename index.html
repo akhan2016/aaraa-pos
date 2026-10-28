@@ -1996,6 +1996,23 @@ function AaraaPOS() {
     return true;
   }
 
+  // Customer returned the whole bill: remove every line and put the suits back into stock.
+  async function deleteBill(items) {
+    const ids = new Set(items.map((x) => x.id));
+    const ok = await persistSales(salesRef.current.filter((x) => !ids.has(x.id)));
+    if (!ok) return false;
+    const back = new Map();
+    items.forEach((x) => back.set(x.barcode, (back.get(x.barcode) || 0) + (Number(x.qty) || 0)));
+    const nextProducts = productsRef.current.map((p) =>
+      back.has(p.barcode) && p.stock !== '' && p.stock != null ? { ...p, stock: Number(p.stock) + back.get(p.barcode) } : p
+    );
+    await persistProducts(nextProducts);
+    if (cloud) refreshDues();
+    setViewingBillId(null);
+    setToast('Bill deleted, stock restored');
+    return true;
+  }
+
   function addProductToCart(product) {
     const existing = cart.find((c) => c.barcode === product.barcode);
     const inCartQty = existing ? existing.qty : 0;
@@ -3522,6 +3539,7 @@ function AaraaPOS() {
           products={products}
           onClose={() => setViewingBillId(null)}
           onEditItem={isStaff ? undefined : (item) => setEditingSale(item)}
+          onDeleteBill={isStaff ? undefined : () => deleteBill(viewingBillItems)}
         />
       )}
 
@@ -4006,7 +4024,11 @@ function InvoiceModal({ items, onClose }) {
   );
 }
 
-function BillDetailModal({ items, products, onClose, onEditItem, onInvoice, onZoom }) {
+function BillDetailModal({ items, products, onClose, onEditItem, onInvoice, onZoom, onDeleteBill }) {
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState('');
+  const invoiceNo = (items.find((x) => x.invoice) || {}).invoice?.no;
   const billTotal = items.reduce((sum, s) => sum + s.total, 0);
   const first = items[0];
   const sharedNote = items.find((s) => s.note)?.note;
@@ -4083,6 +4105,41 @@ function BillDetailModal({ items, products, onClose, onEditItem, onInvoice, onZo
             <span className="text-lg font-semibold" style={{ color: COLORS.ink }}>{formatINR(billTotal)}</span>
           </div>
           {onEditItem && <div className="text-xs text-center mt-3" style={{ color: COLORS.inkSoft }}>Tap an item to edit or delete it.</div>}
+          {onDeleteBill && !confirmDelete && (
+            <button type="button" onClick={() => setConfirmDelete(true)} className="w-full rounded-xl py-3 mt-4 text-sm font-medium" style={{ background: '#F5E4DD', color: COLORS.rust }}>
+              Delete whole bill (customer returned)
+            </button>
+          )}
+          {onDeleteBill && confirmDelete && (
+            <div className="mt-4 rounded-xl p-3" style={{ background: '#F5E4DD', border: `1px solid ${COLORS.rust}` }}>
+              <div className="text-sm font-medium mb-1" style={{ color: COLORS.rust }}>Delete this whole bill?</div>
+              <div className="text-xs mb-3" style={{ color: COLORS.ink }}>
+                The bill of {formatINR(billTotal)} is removed from History and totals, and the suits go back into stock.
+                {invoiceNo ? ` Invoice ${invoiceNo} was issued for this bill — its number stays used, so note it down if you need a credit note.` : ''}
+              </div>
+              {deleteError && <div className="text-xs mb-2" style={{ color: COLORS.rust }}>{deleteError}</div>}
+              <div className="grid grid-cols-2 gap-2">
+                <button type="button" disabled={deleting} onClick={() => setConfirmDelete(false)} className="rounded-xl py-2 text-sm font-medium" style={{ background: COLORS.card, color: COLORS.ink }}>Keep bill</button>
+                <button
+                  type="button"
+                  disabled={deleting}
+                  onClick={async () => {
+                    setDeleting(true);
+                    setDeleteError('');
+                    const ok = await onDeleteBill();
+                    if (!ok) {
+                      setDeleting(false);
+                      setDeleteError('Could not delete — please try again');
+                    }
+                  }}
+                  className="rounded-xl py-2 text-sm font-medium text-white"
+                  style={{ background: COLORS.rust, opacity: deleting ? 0.6 : 1 }}
+                >
+                  {deleting ? 'Deleting…' : 'Yes, delete'}
+                </button>
+              </div>
+            </div>
+          )}
         </div>
       </div>
     </div>
