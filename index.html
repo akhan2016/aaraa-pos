@@ -1819,14 +1819,13 @@ function AaraaPOS() {
     };
   }, [tab, sellModalOpen]);
 
-  // Catalog tab: a scanner gun types the barcode into the search box. Keep that box ready, and
-  // if a scan arrives while focus is elsewhere, send it there.
+  // Catalog tab: the search box is NOT focused automatically (that would pop up the on-screen keyboard).
+  // If a scanner gun / hardware keyboard types while nothing is focused, send those keys to the box.
   const catalogBlocked = !!(editing || cameraOpen || printOpen || viewingBillId || editingSale || viewPhoto);
   useEffect(() => {
     if (tab !== 'catalog' || catalogBlocked) return;
-    const t = setTimeout(() => catalogSearchRef.current && catalogSearchRef.current.focus(), 80);
     function onKey(e) {
-      if (e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1) return;
+      if (e.ctrlKey || e.metaKey || e.altKey || e.key.length !== 1 || e.keyCode === 229) return; // 229 = on-screen keyboard
       const el = document.activeElement;
       const tag = el && el.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
@@ -1838,7 +1837,6 @@ function AaraaPOS() {
     }
     window.addEventListener('keydown', onKey, true);
     return () => {
-      clearTimeout(t);
       window.removeEventListener('keydown', onKey, true);
     };
   }, [tab, catalogBlocked]);
