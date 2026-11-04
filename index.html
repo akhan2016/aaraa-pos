@@ -1167,7 +1167,7 @@ function buildDuesLedger(salesList, payments) {
     if (!p || !p.customerKey) continue;
     const cust = get({ key: p.customerKey, name: p.customerName || '', mobile: p.customerMobile || '' });
     cust.payments.push(p);
-    cust.totalPaid += (Number(p.cash) || 0) + (Number(p.online) || 0);
+    cust.totalPaid += (Number(p.cash) || 0) + (Number(p.online) || 0) + (Number(p.discount) || 0); // a bargained-off amount also clears the due
   }
   const out = [];
   for (const c of customers.values()) {
@@ -1226,7 +1226,7 @@ function CustomerDuesModal({ customer, onClose, onReceive }) {
             <div className="text-xs" style={{ color: '#F0D9E4' }}>Outstanding</div>
             <div className="text-2xl font-semibold text-white">{formatINR(customer.outstanding)}</div>
             <div className="text-xs" style={{ color: '#F0D9E4' }}>
-              Total due {formatINR(customer.totalDue)}{customer.totalPaid > 0 ? ` · paid so far ${formatINR(customer.totalPaid)}` : ''}
+              Total due {formatINR(customer.totalDue)}{customer.totalPaid > 0 ? ` · settled so far ${formatINR(customer.totalPaid)}` : ''}
             </div>
           </div>
           <button type="button" onClick={onReceive} className="w-full rounded-xl py-3 font-medium text-white mb-2" style={{ background: COLORS.teal }}>
@@ -1271,6 +1271,7 @@ function CustomerDuesModal({ customer, onClose, onReceive }) {
                       <div className="text-sm font-medium" style={{ color: COLORS.teal }}>{formatINR((Number(p.cash) || 0) + (Number(p.online) || 0))}</div>
                       <div className="text-xs" style={{ color: COLORS.inkSoft }}>
                         {formatDay(p.timestamp)} · {paymentSplitText({ cash: p.cash, online: p.online })}
+                        {Number(p.discount) > 0 ? ` · discount ${formatINR(p.discount)}` : ''}
                         {p.note ? ` · ${p.note}` : ''}
                       </div>
                     </div>
@@ -1289,14 +1290,18 @@ function CustomerDuesModal({ customer, onClose, onReceive }) {
 // Same Cash / Online / Due choices as a sale: whatever is paid now, and what stays pending.
 function ReceivePaymentModal({ customer, onClose, onConfirm }) {
   const owed = customer.outstanding;
+  const [finalAmt, setFinalAmt] = useState(''); // "final amount after bargaining"; empty = the full outstanding
   const [cash, setCash] = useState('');
   const [online, setOnline] = useState('');
   const [due, setDue] = useState('');
   const [note, setNote] = useState('');
   const [busy, setBusy] = useState(false);
+  const target = finalAmt === '' ? owed : Number(finalAmt) || 0; // what the customer is settling for
+  const finalOk = target > 0 && target <= owed + 0.005;
+  const discount = finalOk ? Math.round((owed - target) * 100) / 100 : 0;
   const assigned = (Number(cash) || 0) + (Number(online) || 0) + (Number(due) || 0);
   const received = (Number(cash) || 0) + (Number(online) || 0);
-  const matches = Math.abs(assigned - owed) < 0.005;
+  const matches = finalOk && Math.abs(assigned - target) < 0.005;
   const ok = matches && received > 0 && !busy;
   const quick = (c, o, d) => { setCash(String(c)); setOnline(String(o)); setDue(String(d)); };
   const chipStyle = { background: COLORS.card, color: COLORS.inkSoft, border: `1px solid ${COLORS.border}` };
@@ -1311,11 +1316,30 @@ function ReceivePaymentModal({ customer, onClose, onConfirm }) {
           <button onClick={onClose}><X size={20} color={COLORS.inkSoft} /></button>
         </div>
         <div className="px-5 pb-5">
+          <div className="rounded-xl px-3 py-2 mb-3" style={{ background: COLORS.card, border: `1px solid ${finalOk ? COLORS.border : COLORS.rust}` }}>
+            <div className="text-xs mb-0.5" style={{ color: finalOk ? COLORS.inkSoft : COLORS.rust }}>Final amount after bargaining ₹</div>
+            <input
+              type="number"
+              inputMode="decimal"
+              value={finalAmt}
+              onChange={(e) => { setFinalAmt(e.target.value); setCash(''); setOnline(''); setDue(''); }}
+              placeholder={String(owed)}
+              className="w-full outline-none bg-transparent text-sm"
+              style={{ color: COLORS.ink }}
+            />
+            <div className="text-xs mt-0.5" style={{ color: discount > 0 ? COLORS.gold : COLORS.inkSoft }}>
+              {!finalOk
+                ? `Enter an amount up to ${formatINR(owed)}`
+                : discount > 0
+                ? `Discount ${formatINR(discount)} — the customer settles ${formatINR(owed)} for ${formatINR(target)}`
+                : 'Leave empty to settle the full outstanding'}
+            </div>
+          </div>
           <div className="text-xs mb-1 px-1" style={{ color: COLORS.inkSoft }}>How was it paid? Split across modes if needed</div>
           <div className="flex gap-2 mb-2">
-            <button type="button" onClick={() => quick(owed, 0, 0)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Cash</button>
-            <button type="button" onClick={() => quick(0, owed, 0)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Online</button>
-            <button type="button" onClick={() => quick(0, 0, owed)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Due</button>
+            <button type="button" disabled={!finalOk} onClick={() => quick(target, 0, 0)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Cash</button>
+            <button type="button" disabled={!finalOk} onClick={() => quick(0, target, 0)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Online</button>
+            <button type="button" disabled={!finalOk} onClick={() => quick(0, 0, target)} className="flex-1 rounded-xl py-2 text-xs font-medium" style={chipStyle}>All Due</button>
           </div>
           <div className="grid grid-cols-3 gap-2">
             <Field label="Cash ₹">
@@ -1333,7 +1357,9 @@ function ReceivePaymentModal({ customer, onClose, onConfirm }) {
               ? received > 0
                 ? `Receiving ${formatINR(received)} · ${formatINR(Number(due) || 0)} stays pending`
                 : 'Enter the cash or online amount received'
-              : `Assigned ${formatINR(assigned)} of ${formatINR(owed)} — ${assigned < owed ? `${formatINR(owed - assigned)} unassigned` : `${formatINR(assigned - owed)} over`}`}
+              : !finalOk
+              ? 'Fix the final amount above'
+              : `Assigned ${formatINR(assigned)} of ${formatINR(target)} — ${assigned < target ? `${formatINR(target - assigned)} unassigned` : `${formatINR(assigned - target)} over`}`}
           </div>
           <div className="mt-3 rounded-xl px-3 py-2" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
             <div className="text-xs mb-0.5" style={{ color: COLORS.inkSoft }}>Note (optional)</div>
@@ -1344,7 +1370,7 @@ function ReceivePaymentModal({ customer, onClose, onConfirm }) {
             disabled={!ok}
             onClick={async () => {
               setBusy(true);
-              const r = await onConfirm({ cash: Number(cash) || 0, online: Number(online) || 0, note: note.trim() });
+              const r = await onConfirm({ cash: Number(cash) || 0, online: Number(online) || 0, discount, note: note.trim() });
               if (!r) setBusy(false);
             }}
             className="w-full rounded-xl py-3 mt-4 font-medium text-white"
@@ -1936,7 +1962,7 @@ function AaraaPOS() {
     [cloud, duesData, sales, payments]
   );
 
-  async function receivePayment(customer, { cash, online, note }) {
+  async function receivePayment(customer, { cash, online, discount, note }) {
     const doc = {
       id: `pay-${Date.now()}-${Math.floor(Math.random() * 10000)}`,
       timestamp: new Date().toISOString(),
@@ -1945,6 +1971,7 @@ function AaraaPOS() {
       customerMobile: customer.mobile || '',
       cash,
       online,
+      discount: discount > 0 ? discount : undefined, // bargained-off part of the due
       note: note || null,
     };
     const ok = await persistPayments([doc, ...paymentsRef.current]);
