@@ -1134,7 +1134,7 @@ function billCustomer(items) {
 
 // Pending amount for every customer: all their dues, minus every payment they have made since.
 // Payments are matched to the oldest bills first. Returns customers with something outstanding, biggest first.
-function buildDuesLedger(salesList, payments) {
+function buildDuesLedger(salesList, payments, includeCleared) {
   const bills = new Map();
   for (const s of salesList || []) {
     const k = s.billId || s.id;
@@ -1185,7 +1185,7 @@ function buildDuesLedger(salesList, payments) {
     c.outstanding = Math.round((c.totalDue - c.totalPaid) * 100) / 100;
     c.oldest = c.bills.find((b) => b.pending > 0) ? c.bills.find((b) => b.pending > 0).date : null;
     c.displayName = c.name || (c.mobile ? c.mobile : 'Unknown customer');
-    if (c.outstanding > 0) out.push(c);
+    if (c.outstanding > 0 || includeCleared) out.push(c);
   }
   out.sort((a, b) => b.outstanding - a.outstanding);
   return out;
@@ -2155,6 +2155,15 @@ function AaraaPOS() {
     () => buildDuesLedger(cloud ? duesData.sales : sales, cloud ? duesData.payments : payments),
     [cloud, duesData, sales, payments]
   );
+
+  // For every bill that had a due amount: how much of it has been received since, and how much is still pending.
+  const billDueStatus = useMemo(() => {
+    const map = new Map();
+    buildDuesLedger(cloud ? duesData.sales : sales, cloud ? duesData.payments : payments, true).forEach((c) =>
+      c.bills.forEach((b) => map.set(b.id, { due: b.due, paid: b.paid, pending: b.pending }))
+    );
+    return map;
+  }, [cloud, duesData, sales, payments]);
 
   async function receivePayment(customer, { cash, online, discount, note }) {
     const doc = {
@@ -3561,16 +3570,16 @@ function AaraaPOS() {
                 Online payments list (choose dates)
               </button>
             )}
-            {todaysPayments.length > 0 && (
+            {payments.length > 0 && (
               <div className="mb-5">
-                <div className="text-xs font-medium mb-2" style={{ color: COLORS.inkSoft }}>Payments received today (against dues)</div>
+                <div className="text-xs font-medium mb-2" style={{ color: COLORS.inkSoft }}>Payments received against dues</div>
                 <div className="space-y-2">
-                  {todaysPayments.map((x) => (
+                  {payments.slice(0, 15).map((x) => (
                     <div key={x.id} className="rounded-lg p-3 flex items-center justify-between gap-2" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                       <div className="min-w-0">
                         <div className="text-sm font-medium truncate" style={{ color: COLORS.ink }}>{x.customerName || x.customerMobile || 'Customer'}</div>
                         <div className="text-xs" style={{ color: COLORS.inkSoft }}>
-                          {new Date(x.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })} · {paymentSplitText({ cash: x.cash, online: x.online })}
+                          {formatDay(x.timestamp)} {new Date(x.timestamp).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' })} · {paymentSplitText({ cash: x.cash, online: x.online })}{Number(x.discount) > 0 ? ` · discount ${formatINR(x.discount)}` : ''} · received ✓
                         </div>
                       </div>
                       <div className="text-sm font-medium flex-shrink-0" style={{ color: COLORS.teal }}>{formatINR((Number(x.cash) || 0) + (Number(x.online) || 0))}</div>
@@ -3636,36 +3645,50 @@ function AaraaPOS() {
                               {sharedNote && <div className="text-xs mt-0.5 truncate" style={{ color: COLORS.gold }}>{sharedNote}</div>}
                               {(() => {
                                 const inv = (items.find((s) => s.invoice) || {}).invoice;
-                                if (!inv) return null;
+                                const cu = items.some((s) => s.customer || s.invoice) ? billCustomer(items) : null;
                                 return (
                                   <>
-                                  {inv.customerName && (
+                                  {cu && (cu.name || cu.mobile) && (
                                     <div className="text-xs font-medium mt-0.5 truncate" style={{ color: COLORS.ink }}>
-                                      Customer: {inv.customerName}{inv.customerMobile ? ` · ${inv.customerMobile}` : ''}
+                                      Customer: {cu.name}{cu.name && cu.mobile ? ' · ' : ''}{cu.mobile}
                                     </div>
                                   )}
-                                  <span
+                                  {inv && (<span
                                     role="button"
                                     onClick={(e) => { e.stopPropagation(); setInvoiceItems(items); }}
                                     className="text-xs px-2 py-0.5 rounded-full inline-block mt-1 max-w-full truncate"
                                     style={{ background: COLORS.chip, color: COLORS.primary, border: `1px solid ${COLORS.border}` }}
                                   >
                                     Invoice {inv.no}{inv.customerName ? ` · ${inv.customerName}` : ''}{inv.basis === 'online' ? ' · online part' : ''}
-                                  </span>
+                                  </span>)}
                                   </>
                                 );
                               })()}
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
                               <div className="text-right">
+                                {hasDue && (() => {
+                                  const st = billDueStatus.get(key);
+                                  if (st && st.pending <= 0) {
+                                    return (
+                                      <span className="text-xs px-2 py-0.5 rounded-full inline-block mb-0.5" style={{ background: '#DDEFE9', color: COLORS.teal }}>
+                                        Due {formatINR(billSplit.due)} received ✓
+                                      </span>
+                                    );
+                                  }
+                                  return (
+                                    <span className="text-xs px-2 py-0.5 rounded-full inline-block mb-0.5" style={{ background: '#F5E4DD', color: COLORS.rust }}>
+                                      Due {formatINR(st ? st.pending : billSplit.due)}{st && st.paid > 0 ? ' pending' : ''}
+                                    </span>
+                                  );
+                                })()}
+                                <div className="text-sm font-medium" style={{ color: COLORS.teal }}>
+                                  {formatINR(billSplit.cash + billSplit.online + (hasDue && billDueStatus.get(key) ? billDueStatus.get(key).paid : 0))}
+                                </div>
                                 {hasDue && (
-                                  <span className="text-xs px-2 py-0.5 rounded-full inline-block mb-0.5" style={{ background: '#F5E4DD', color: COLORS.rust }}>
-                                    Due {formatINR(billSplit.due)}
-                                  </span>
-                                )}
-                                <div className="text-sm font-medium" style={{ color: COLORS.teal }}>{formatINR(billSplit.cash + billSplit.online)}</div>
-                                {hasDue && (
-                                  <div className="text-xs" style={{ color: COLORS.inkSoft }}>of {formatINR(billTotal)} billed</div>
+                                  <div className="text-xs" style={{ color: COLORS.inkSoft }}>
+                                    {billDueStatus.get(key) && billDueStatus.get(key).paid > 0 ? `incl. ${formatINR(billDueStatus.get(key).paid)} received later · ` : ''}of {formatINR(billTotal)} billed
+                                  </div>
                                 )}
                               </div>
                             </div>
@@ -3783,6 +3806,7 @@ function AaraaPOS() {
         <BillDetailModal
           items={viewingBillItems}
           onInvoice={() => setInvoiceItems(viewingBillItems)}
+          dueStatus={billDueStatus.get(viewingBillId)}
           onZoom={(prod) => setViewPhoto(prod)}
           products={products}
           onClose={() => setViewingBillId(null)}
@@ -4272,7 +4296,7 @@ function InvoiceModal({ items, onClose }) {
   );
 }
 
-function BillDetailModal({ items, products, onClose, onEditItem, onInvoice, onZoom, onDeleteBill }) {
+function BillDetailModal({ items, products, onClose, onEditItem, onInvoice, onZoom, onDeleteBill, dueStatus }) {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState('');
@@ -4291,14 +4315,25 @@ function BillDetailModal({ items, products, onClose, onEditItem, onInvoice, onZo
             <div className="text-xs" style={{ color: COLORS.inkSoft }}>
               {new Date(first.timestamp).toLocaleString('en-IN')}
             </div>
-            {(items.find((x) => x.invoice) || {}).invoice?.customerName && (
-              <div className="text-xs mt-0.5 font-medium" style={{ color: COLORS.ink }}>
-                Customer: {items.find((x) => x.invoice).invoice.customerName}
-                {items.find((x) => x.invoice).invoice.customerMobile ? ` · ${items.find((x) => x.invoice).invoice.customerMobile}` : ''}
-              </div>
-            )}
+            {items.some((x) => x.customer || x.invoice) && (() => {
+              const cu = billCustomer(items);
+              return (cu.name || cu.mobile) ? (
+                <div className="text-xs mt-0.5 font-medium" style={{ color: COLORS.ink }}>
+                  Customer: {cu.name}{cu.name && cu.mobile ? ' · ' : ''}{cu.mobile}
+                </div>
+              ) : null;
+            })()}
             {paymentSplitText(billSplit) && (
               <div className="text-xs mt-0.5" style={{ color: COLORS.inkSoft }}>{paymentSplitText(billSplit)}</div>
+            )}
+            {billSplit.due > 0 && dueStatus && (
+              <div className="text-xs mt-0.5 font-medium" style={{ color: dueStatus.pending <= 0 ? COLORS.teal : COLORS.rust }}>
+                {dueStatus.pending <= 0
+                  ? `Due ${formatINR(dueStatus.due)} — received ✓`
+                  : dueStatus.paid > 0
+                  ? `Due ${formatINR(dueStatus.due)} — ${formatINR(dueStatus.paid)} received, ${formatINR(dueStatus.pending)} pending`
+                  : `Due ${formatINR(dueStatus.due)} — pending`}
+              </div>
             )}
           </div>
           <button onClick={onClose}><X size={20} color={COLORS.inkSoft} /></button>
