@@ -1384,6 +1384,138 @@ function ReceivePaymentModal({ customer, onClose, onConfirm }) {
   );
 }
 
+// Who paid online between two dates: online part of each sale, plus dues collected online.
+function buildOnlineRows(salesList, payments, fromStr, toStr) {
+  const [fy, fm, fd] = fromStr.split('-').map(Number);
+  const [ty, tm, td] = toStr.split('-').map(Number);
+  const start = new Date(fy, fm - 1, fd, 0, 0, 0, 0).getTime();
+  const end = new Date(ty, tm - 1, td, 23, 59, 59, 999).getTime();
+  const bills = new Map();
+  for (const x of salesList) {
+    const k = x.billId || x.id;
+    if (!bills.has(k)) bills.set(k, []);
+    bills.get(k).push(x);
+  }
+  const rows = [];
+  for (const [id, items] of bills) {
+    const t = new Date(items[0].timestamp).getTime();
+    if (t < start || t > end) continue;
+    const online = Math.round((aggregateBillSplit(items).online || 0) * 100) / 100;
+    if (online <= 0) continue;
+    const c = billCustomer(items);
+    const inv = (items.find((x) => x.invoice) || {}).invoice;
+    rows.push({ id, t, date: items[0].timestamp, name: c.name || c.mobile || 'Unknown customer', mobile: c.mobile, amount: online, type: 'Sale', invoice: inv ? inv.no : '' });
+  }
+  for (const p of payments) {
+    const t = new Date(p.timestamp).getTime();
+    const online = Number(p.online) || 0;
+    if (t < start || t > end || online <= 0) continue;
+    rows.push({ id: p.id, t, date: p.timestamp, name: p.customerName || p.customerMobile || 'Unknown customer', mobile: p.customerMobile || '', amount: online, type: 'Due payment', invoice: '' });
+  }
+  rows.sort((a, b) => a.t - b.t);
+  return rows;
+}
+
+function OnlineReportModal({ sales: salesList, payments, onClose, onToast }) {
+  const today = todayInputValue();
+  const monthStart = today.slice(0, 8) + '01';
+  const [from, setFrom] = useState(monthStart);
+  const [to, setTo] = useState(today);
+  const valid = from && to && from <= to;
+  const rows = useMemo(() => (valid ? buildOnlineRows(salesList, payments, from, to) : []), [salesList, payments, from, to, valid]);
+  const total = rows.reduce((sum, r) => sum + r.amount, 0);
+
+  async function downloadCsv() {
+    const esc = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+    const lines = [['Date', 'Customer', 'Mobile', 'Amount', 'Type', 'Invoice'].map(esc).join(',')];
+    rows.forEach((r) => lines.push([formatDay(r.date), r.name, r.mobile, r.amount, r.type, r.invoice].map(esc).join(',')));
+    lines.push(['', 'Total', '', total, '', ''].map(esc).join(','));
+    const csv = '﻿' + lines.join('\n'); // BOM so Excel shows ₹ and Hindi/Urdu names correctly
+    const filename = `aaraa-online-payments-${from}-to-${to}.csv`;
+    try {
+      const downloads = await getClaudeCap('downloads');
+      if (downloads) {
+        await downloads.save({ filename, data: csv });
+      } else {
+        const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      }
+      onToast('List saved as a CSV file');
+    } catch (e) {
+      if (e && e.code === 'declined') return;
+      onToast('Could not create the file');
+    }
+  }
+
+  async function copyList() {
+    const text = [`Online payments ${formatDay(from)} to ${formatDay(to)}`]
+      .concat(rows.map((r) => `${formatDay(r.date)} - ${r.name} - ₹${r.amount}`))
+      .concat([`Total: ₹${total}`])
+      .join('\n');
+    onToast((await copyText(text)) ? 'List copied' : 'Could not copy');
+  }
+
+  return (
+    <div className="fixed inset-0 flex items-end justify-center z-10" style={{ background: 'rgba(43,36,30,0.5)' }}>
+      <div className="w-full rounded-t-2xl overflow-y-auto" style={{ background: COLORS.bg, maxHeight: '92vh' }}>
+        <div className="flex items-center justify-between px-5 pt-5 pb-3">
+          <div className="text-lg font-semibold" style={{ color: COLORS.ink }}>Online payments</div>
+          <button onClick={onClose}><X size={20} color={COLORS.inkSoft} /></button>
+        </div>
+        <div className="px-5 pb-5">
+          <div className="grid grid-cols-2 gap-2 mb-3">
+            <Field label="From">
+              <input type="date" value={from} max={today} onChange={(e) => setFrom(e.target.value)} className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+            </Field>
+            <Field label="To">
+              <input type="date" value={to} max={today} onChange={(e) => setTo(e.target.value)} className="w-full outline-none bg-transparent text-sm" style={{ color: COLORS.ink }} />
+            </Field>
+          </div>
+          {!valid ? (
+            <div className="text-sm py-8 text-center" style={{ color: COLORS.rust }}>Pick a start date that is not after the end date.</div>
+          ) : (
+            <>
+              <div className="rounded-xl p-3 mb-3 flex items-center justify-between" style={{ background: COLORS.primary }}>
+                <div className="text-xs" style={{ color: '#F0D9E4' }}>{rows.length} payment{rows.length === 1 ? '' : 's'}</div>
+                <div className="text-lg font-semibold text-white">{formatINR(total)}</div>
+              </div>
+              {rows.length === 0 ? (
+                <div className="text-sm py-8 text-center" style={{ color: COLORS.inkSoft }}>No online payments in this period.</div>
+              ) : (
+                <div className="rounded-xl overflow-hidden mb-3" style={{ border: `1px solid ${COLORS.border}`, background: COLORS.card }}>
+                  <div className="grid text-xs px-3 py-2" style={{ gridTemplateColumns: '84px 1fr 80px', color: COLORS.inkSoft, background: COLORS.chip }}>
+                    <div>Date</div><div>Customer</div><div className="text-right">Amount</div>
+                  </div>
+                  {rows.map((r) => (
+                    <div key={r.type + r.id} className="grid text-sm px-3 py-2 items-center" style={{ gridTemplateColumns: '84px 1fr 80px', borderTop: `1px solid ${COLORS.border}`, color: COLORS.ink }}>
+                      <div className="text-xs" style={{ color: COLORS.inkSoft }}>{new Date(r.date).toLocaleDateString('en-IN', { day: '2-digit', month: 'short' })}</div>
+                      <div className="min-w-0">
+                        <div className="truncate">{r.name}</div>
+                        {r.type !== 'Sale' && <div className="text-xs" style={{ color: COLORS.inkSoft }}>due payment</div>}
+                      </div>
+                      <div className="text-right font-medium">{formatINR(r.amount)}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="grid grid-cols-2 gap-2">
+                <button type="button" disabled={!rows.length} onClick={downloadCsv} className="rounded-xl py-3 text-sm font-medium text-white" style={{ background: COLORS.primary, opacity: rows.length ? 1 : 0.5 }}>Download list (CSV)</button>
+                <button type="button" disabled={!rows.length} onClick={copyList} className="rounded-xl py-3 text-sm font-medium" style={{ background: COLORS.chip, color: COLORS.primary, opacity: rows.length ? 1 : 0.5 }}>Copy list</button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Full-screen photo viewer: swipe/tap thumbnails to change photo, tap the photo to zoom in and drag to look around.
 function PhotoViewer({ product, onClose }) {
   const photos = product.images && product.images.length ? product.images : product.image ? [product.image] : [];
@@ -1485,6 +1617,7 @@ function AaraaPOS() {
   const [payCash, setPayCash] = useState('');
   const [custName, setCustName] = useState('');
   const [custMobile, setCustMobile] = useState('');
+  const [reportOpen, setReportOpen] = useState(false); // online payments report
   const [saleDate, setSaleDate] = useState(''); // '' = today; admin can pick an earlier day for a sale recorded late
   const [invoiceBasis, setInvoiceBasis] = useState(''); // '' | 'full' | 'online' — asked when payment is part online, part cash/due
   const [invoiceItems, setInvoiceItems] = useState(null); // sale lines of the bill whose invoice is open
@@ -3339,6 +3472,11 @@ function AaraaPOS() {
             {isStaff && (
               <div className="text-xs mb-3" style={{ color: COLORS.inkSoft }}>Showing today's bills only.</div>
             )}
+            {!isStaff && (
+              <button type="button" onClick={() => setReportOpen(true)} className="w-full rounded-xl py-3 mb-4 text-sm font-medium" style={{ background: COLORS.chip, color: COLORS.primary }}>
+                Online payments list (choose dates)
+              </button>
+            )}
             {todaysPayments.length > 0 && (
               <div className="mb-5">
                 <div className="text-xs font-medium mb-2" style={{ color: COLORS.inkSoft }}>Payments received today (against dues)</div>
@@ -3553,6 +3691,7 @@ function AaraaPOS() {
           onConfirm={(v) => receivePayment(duesCustomers.find((c) => c.key === receiveKey), v)}
         />
       )}
+      {reportOpen && <OnlineReportModal sales={sales} payments={payments} onClose={() => setReportOpen(false)} onToast={setToast} />}
       {viewPhoto && <PhotoViewer product={products.find((x) => x.barcode === viewPhoto.barcode) || viewPhoto} onClose={() => { setViewPhoto(null); setTimeout(() => scanRef.current && scanRef.current.focus(), 60); }} />}
       {invoiceItems && <InvoiceModal items={invoiceItems} onClose={() => setInvoiceItems(null)} />}
 
