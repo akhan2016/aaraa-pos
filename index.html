@@ -36,6 +36,8 @@
     function Scan(p) { return (<IconBase {...p}><path d="M3 7V4a1 1 0 0 1 1-1h3" /><path d="M17 3h3a1 1 0 0 1 1 1v3" /><path d="M21 17v3a1 1 0 0 1-1 1h-3" /><path d="M7 21H4a1 1 0 0 1-1-1v-3" /><line x1="4" y1="12" x2="20" y2="12" /></IconBase>); }
     function LayoutGrid(p) { return (<IconBase {...p}><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></IconBase>); }
     function Wallet(p) { return (<IconBase {...p}><path d="M20 7H5a2 2 0 0 1 0-4h13v4" /><path d="M3 5v14a2 2 0 0 0 2 2h15V7" /><circle cx="16" cy="14" r="1.2" /></IconBase>); }
+    function Volume2(p) { return (<IconBase {...p}><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><path d="M15.5 8.5a5 5 0 0 1 0 7" /><path d="M18.5 5.5a9 9 0 0 1 0 13" /></IconBase>); }
+    function VolumeX(p) { return (<IconBase {...p}><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5" /><line x1="22" y1="9" x2="16" y2="15" /><line x1="16" y1="9" x2="22" y2="15" /></IconBase>); }
     function Receipt(p) { return (<IconBase {...p}><path d="M5 3h14v18l-2-1.3-2 1.3-2-1.3-2 1.3-2-1.3-2 1.3-2-1.3V3z" /><line x1="8" y1="8" x2="16" y2="8" /><line x1="8" y1="12" x2="16" y2="12" /><line x1="8" y1="16" x2="12" y2="16" /></IconBase>); }
     function Plus(p) { return (<IconBase {...p}><line x1="12" y1="5" x2="12" y2="19" /><line x1="5" y1="12" x2="19" y2="12" /></IconBase>); }
     function X(p) { return (<IconBase {...p}><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></IconBase>); }
@@ -1189,6 +1191,53 @@ function buildDuesLedger(salesList, payments) {
   return out;
 }
 
+// ---- Scan sounds: a short beep when a suit is found, a low double buzz when it isn't ----
+const SOUND_KEY = 'aaraa_sound_off';
+let audioCtx = null;
+function soundOn() {
+  try { return localStorage.getItem(SOUND_KEY) !== '1'; } catch (e) { return true; }
+}
+function setSoundOn(on) {
+  try { localStorage.setItem(SOUND_KEY, on ? '0' : '1'); } catch (e) {}
+}
+function getAudio() {
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    if (!audioCtx) audioCtx = new AC();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    return audioCtx;
+  } catch (e) {
+    return null;
+  }
+}
+function tone(ctx, freq, start, dur, type, vol) {
+  const o = ctx.createOscillator();
+  const g = ctx.createGain();
+  o.type = type;
+  o.frequency.value = freq;
+  g.gain.setValueAtTime(0.0001, start);
+  g.gain.exponentialRampToValueAtTime(vol, start + 0.01);
+  g.gain.exponentialRampToValueAtTime(0.0001, start + dur);
+  o.connect(g);
+  g.connect(ctx.destination);
+  o.start(start);
+  o.stop(start + dur + 0.02);
+}
+function playSound(kind) {
+  if (!soundOn()) return;
+  const ctx = getAudio();
+  if (!ctx) return;
+  const t = ctx.currentTime + 0.01;
+  if (kind === 'ok') {
+    tone(ctx, 1760, t, 0.13, 'sine', 0.35);
+  } else {
+    tone(ctx, 260, t, 0.2, 'square', 0.22);
+    tone(ctx, 200, t + 0.26, 0.3, 'square', 0.22);
+    try { navigator.vibrate && navigator.vibrate([120, 60, 180]); } catch (e) {}
+  }
+}
+
 // Today as YYYY-MM-DD in the device's own time zone (what a date input expects).
 function todayInputValue() {
   const d = new Date();
@@ -1617,6 +1666,7 @@ function AaraaPOS() {
   const [payCash, setPayCash] = useState('');
   const [custName, setCustName] = useState('');
   const [custMobile, setCustMobile] = useState('');
+  const [soundEnabled, setSoundEnabled] = useState(soundOn());
   const [reportOpen, setReportOpen] = useState(false); // online payments report
   const [saleDate, setSaleDate] = useState(''); // '' = today; admin can pick an earlier day for a sale recorded late
   const [invoiceBasis, setInvoiceBasis] = useState(''); // '' | 'full' | 'online' — asked when payment is part online, part cash/due
@@ -1685,6 +1735,17 @@ function AaraaPOS() {
   useEffect(() => {
     paymentsRef.current = payments;
   }, [payments]);
+
+  // Browsers only allow sound after a tap or key press, so wake the audio up on the first one.
+  useEffect(() => {
+    const unlock = () => getAudio();
+    window.addEventListener('pointerdown', unlock, { once: true });
+    window.addEventListener('keydown', unlock, { once: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    };
+  }, []);
 
   useEffect(() => {
     if (cart.length === 0) setSaleDate(''); // a new bill starts on today's date
@@ -2196,11 +2257,17 @@ function AaraaPOS() {
       // On the Catalog tab a scan just searches for that barcode.
       setSearch(code);
       setCameraOpen(false);
-      return { ok: true, text: `Searching ${code}` };
+      const exists = products.some((p) => p.barcode === code);
+      playSound(exists ? 'ok' : 'warn');
+      return { ok: true, text: exists ? `Found ${code}` : `No suit found for ${code}` };
     }
     const product = products.find((p) => p.barcode === code);
-    if (!product) return { ok: false, text: `No suit found for ${code}` };
+    if (!product) {
+      playSound('warn');
+      return { ok: false, text: `No suit found for ${code}` };
+    }
     const added = addProductToCart(product);
+    playSound(added ? 'ok' : 'warn');
     return added
       ? { ok: true, text: `Added: ${product.name}` }
       : { ok: false, text: `Only ${product.stock} in stock for "${product.name}"` };
@@ -2254,15 +2321,17 @@ function AaraaPOS() {
       } else if (near.length > 1) {
         setScanError(`Scanner sent "${code}" — that fits ${near.length} suits (${near.slice(0, 3).map((p) => p.barcode).join(', ')}). Scan again.`);
         setScanValue('');
+        playSound('warn');
         return;
       }
     }
     if (!product) {
       setScanError(`No suit found for barcode "${code}"`);
       setScanValue('');
+      playSound('warn');
       return;
     }
-    addProductToCart(product);
+    playSound(addProductToCart(product) ? 'ok' : 'warn'); // a suit that is out of stock also gets the warning
     setScanValue('');
   }
 
@@ -2834,6 +2903,20 @@ function AaraaPOS() {
           </div>
         </div>
         <div className="flex items-center gap-3">
+          <button
+            type="button"
+            aria-label={soundEnabled ? 'Mute scan sounds' : 'Turn on scan sounds'}
+            onClick={() => {
+              const next = !soundEnabled;
+              setSoundOn(next);
+              setSoundEnabled(next);
+              if (next) playSound('ok');
+            }}
+            className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0"
+            style={{ background: COLORS.chip }}
+          >
+            {soundEnabled ? <Volume2 size={14} color={COLORS.primary} /> : <VolumeX size={14} color={COLORS.inkSoft} />}
+          </button>
           {(tab === 'sell' || tab === 'catalog' || tab === 'dues') && (
             <button onClick={handleRefresh} className="w-8 h-8 rounded-full flex items-center justify-center flex-shrink-0" style={{ background: COLORS.chip }}>
               <RefreshCw size={14} color={COLORS.primary} className={refreshing ? 'animate-spin' : ''} />
@@ -3289,6 +3372,7 @@ function AaraaPOS() {
                       // A scanner ends each code with Enter: keep the result, and select the text so the next scan replaces it.
                       e.preventDefault();
                       e.target.select();
+                      if (e.key === 'Enter' && e.target.value.trim()) playSound(filteredProducts.length > 0 ? 'ok' : 'warn');
                     }
                   }}
                   placeholder="Scan, or search by name, barcode, fabric"
