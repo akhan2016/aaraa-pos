@@ -1667,6 +1667,7 @@ function AaraaPOS() {
   const [custName, setCustName] = useState('');
   const [custMobile, setCustMobile] = useState('');
   const [soundEnabled, setSoundEnabled] = useState(soundOn());
+  const [renameAsk, setRenameAsk] = useState(false); // two-tap confirm for renaming old 'Suit …' names
   const [reportOpen, setReportOpen] = useState(false); // online payments report
   const [saleDate, setSaleDate] = useState(''); // '' = today; admin can pick an earlier day for a sale recorded late
   const [invoiceBasis, setInvoiceBasis] = useState(''); // '' | 'full' | 'online' — asked when payment is part online, part cash/due
@@ -1694,6 +1695,7 @@ function AaraaPOS() {
   const [needLogin, setNeedLogin] = useState(false);
   const [cloudEmail, setCloudEmail] = useState('');
   const [viewPhoto, setViewPhoto] = useState(null); // suit whose photo is open full-screen
+  const [roleError, setRoleError] = useState('');
   const [role, setRole] = useState(''); // 'admin' | 'staff' ('' until known); only meaningful on the shared database
   const [localLeft, setLocalLeft] = useState(null); // suits/sales on this device that aren't in the shared database yet
   const localCheckedRef = useRef(false);
@@ -1810,6 +1812,32 @@ function AaraaPOS() {
     if (db.isSupabase) await refreshDues();
   }, [refreshDues]);
 
+  // Asks the database whether this login is admin or staff. Only a real answer changes the role;
+  // a failed check (slow network, expired token) keeps the last known role and is retried below.
+  const refreshRole = useCallback(async () => {
+    const mail = supa.email();
+    try {
+      const r = await supa.role();
+      setRole(r);
+      setRoleError('');
+      try { localStorage.setItem(`aaraa_role_${mail}`, r); } catch (e) {}
+      return r;
+    } catch (e) {
+      setRoleError((e && e.message) || 'unknown error');
+      try {
+        const cached = localStorage.getItem(`aaraa_role_${mail}`);
+        if (cached === 'admin' || cached === 'staff') setRole(cached);
+      } catch (e2) {}
+      return '';
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!cloud || role) return;
+    const t = setInterval(refreshRole, 6000); // still unknown: keep trying
+    return () => clearInterval(t);
+  }, [cloud, role, refreshRole]);
+
   useEffect(() => {
     (async () => {
       let db = await getClaudeDb();
@@ -1824,7 +1852,7 @@ function AaraaPOS() {
         db = supa.db;
         setCloudEmail(who);
         setCloud(true);
-        try { setRole(await supa.role()); } catch (e) { setRole('staff'); }
+        refreshRole(); // not awaited: a slow or failed check must never hold up the catalog
       }
       dbRef.current = db;
       if (db.isSupabase) {
@@ -1852,7 +1880,7 @@ function AaraaPOS() {
     dbRef.current = supa.db;
     setCloudEmail(who);
     setCloud(true);
-    try { setRole(await supa.role()); } catch (e) { setRole('staff'); }
+    refreshRole();
     setNeedLogin(false);
     await loadData();
   }
@@ -2225,6 +2253,16 @@ function AaraaPOS() {
   }
 
   // Customer returned the whole bill: remove every line and put the suits back into stock.
+  // Older suits saved without a name are called "Suit 123456"; this renames them to "Fabrics 123456".
+  async function renameOldSuitNames() {
+    const next = productsRef.current.map((p) => (/^Suit \d+$/.test(p.name || '') ? { ...p, name: p.name.replace(/^Suit /, 'Fabrics ') } : p));
+    const n = next.filter((p, i) => p !== productsRef.current[i]).length;
+    if (!n) return;
+    const ok = await persistProducts(next);
+    setRenameAsk(false);
+    setToast(ok ? `Renamed ${n} suit${n === 1 ? '' : 's'} to Fabrics` : 'Could not rename — please try again');
+  }
+
   async function deleteBill(items) {
     const ids = new Set(items.map((x) => x.id));
     const ok = await persistSales(salesRef.current.filter((x) => !ids.has(x.id)));
@@ -2657,7 +2695,7 @@ function AaraaPOS() {
     if (dup) return 'duplicate';
     const record = {
       barcode,
-      name: form.name.trim() || `Suit ${barcode}`, // name is optional; fall back to the barcode so it still shows everywhere
+      name: form.name.trim() || `Fabrics ${barcode}`, // name is optional; fall back to the barcode so it still shows everywhere
       price: Number(form.price),
       stock: form.stock === '' ? '' : Number(form.stock),
       topFabric: form.topFabric.trim(),
@@ -3404,8 +3442,20 @@ function AaraaPOS() {
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 mb-3 -mt-2 text-xs" style={{ color: COLORS.inkSoft }}>
               {cloud && (
                 <span>
-                  Shared database · {cloudEmail} · <button type="button" onClick={handleSignOut} className="underline">Sign out</button>
+                  Shared database · {cloudEmail} · {role === 'admin' ? 'admin' : role === 'staff' ? 'staff' : roleError ? 'role check failed' : 'checking role…'} · <button type="button" onClick={handleSignOut} className="underline">Sign out</button>
                 </span>
+              )}
+              {!isStaff && products.some((p) => /^Suit \d+$/.test(p.name || '')) && (
+                <button
+                  type="button"
+                  onClick={() => (renameAsk ? renameOldSuitNames() : setRenameAsk(true))}
+                  className="underline"
+                  style={{ color: renameAsk ? COLORS.rust : undefined }}
+                >
+                  {renameAsk
+                    ? `Tap again: rename ${products.filter((p) => /^Suit \d+$/.test(p.name || '')).length} suits to Fabrics`
+                    : 'Rename "Suit …" names to "Fabrics …"'}
+                </button>
               )}
               {!isStaff && (<>
               <button type="button" onClick={exportData} className="underline">Export backup</button>
@@ -3452,7 +3502,14 @@ function AaraaPOS() {
             ) : (
               <div className="grid grid-cols-2 gap-3">
                 {filteredProducts.slice(0, visibleCount).map((p) => (
-                  <button key={p.barcode} onClick={() => (isStaff ? setToast('Only the admin can edit or delete suits') : setEditing(p))} className="text-left rounded-xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
+                  <button key={p.barcode} onClick={() => {
+                    if (!isStaff) return setEditing(p);
+                    if (!role) {
+                      refreshRole();
+                      return setToast(roleError ? `Could not check your role (${roleError.slice(0, 60)}) — retrying` : 'Checking your role… tap again in a moment');
+                    }
+                    setToast('Only the admin can edit or delete suits');
+                  }} className="text-left rounded-xl overflow-hidden" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                     <div className="w-full aspect-square relative" style={{ background: COLORS.chip }}>
                       {p.image && <img src={p.thumb || p.image} alt={p.name} loading="lazy" decoding="async" className="w-full h-full object-cover" />}
                       {p.image && (
