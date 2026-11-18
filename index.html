@@ -2637,6 +2637,34 @@ function AaraaPOS() {
   const [backupMode, setBackupMode] = useState(null); // null | 'copy' | 'paste'
   const [backupText, setBackupText] = useState('');
 
+  // CSV for Odoo's product import (Inventory > Products > Import records).
+  async function exportOdooCsv() {
+    const q = (v) => `"${String(v == null ? '' : v).replace(/"/g, '""')}"`;
+    const rows = productsRef.current.filter((p) => p.barcode);
+    const lines = ['Name,Product Type,Track Inventory,Sales Price,Barcode'];
+    rows.forEach((p) => lines.push([q(p.name || `Fabrics ${p.barcode}`), q('Goods'), q('True'), q(Number(p.price) || 0), q(p.barcode)].join(',')));
+    const csv = '\ufeff' + lines.join('\r\n');
+    const filename = 'aaraa-products-for-odoo.csv';
+    try {
+      const downloads = await getClaudeCap('downloads');
+      if (downloads) {
+        await downloads.save({ filename, data: csv });
+      } else {
+        const url = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 5000);
+      }
+      setToast(`Odoo file saved: ${rows.length} suits`);
+    } catch (e) {
+      setToast('Could not save the Odoo file');
+    }
+  }
+
   async function exportData() {
     const payload = JSON.stringify({
       app: 'aaraa-pos',
@@ -3495,6 +3523,7 @@ function AaraaPOS() {
                 </button>
               )}
               {!isStaff && cloud && (<>
+              <button type="button" onClick={exportOdooCsv} className="underline">Odoo: export file</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('test')} className="underline">Odoo: test</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('preview')} className="underline">Odoo: preview</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('sync')} className="underline font-semibold">{odooBusy ? 'Odoo: working…' : 'Odoo: sync stock'}</button>
