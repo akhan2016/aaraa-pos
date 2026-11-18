@@ -1085,6 +1085,18 @@ const supa = (() => {
     },
     nextInvoice: (fy) => rpc('pos_next_invoice', { fy }),
     dues: () => rpc('pos_dues'),
+    callFn: async (name, body) => {
+      if (!session) throw new Error('Not signed in');
+      if (session.expires_at - 30 < Date.now() / 1000) await refresh();
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/${name}`, {
+        method: 'POST',
+        headers: { apikey: SUPABASE_KEY, Authorization: `Bearer ${session.access_token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body || {}),
+      });
+      const j = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(j.error || j.message || `Sync function error ${res.status}`);
+      return j;
+    },
     busy: () => pending > 0,
     seq: () => writeSeq,
   };
@@ -1667,6 +1679,8 @@ function AaraaPOS() {
   const [custName, setCustName] = useState('');
   const [custMobile, setCustMobile] = useState('');
   const [soundEnabled, setSoundEnabled] = useState(soundOn());
+  const [odooBusy, setOdooBusy] = useState(false);
+  const [odooResult, setOdooResult] = useState(null);
   const [renameAsk, setRenameAsk] = useState(false); // two-tap confirm for renaming old 'Suit …' names
   const [reportOpen, setReportOpen] = useState(false); // online payments report
   const [saleDate, setSaleDate] = useState(''); // '' = today; admin can pick an earlier day for a sale recorded late
@@ -2250,6 +2264,19 @@ function AaraaPOS() {
     );
     await persistProducts(nextProducts);
     return true;
+  }
+
+  async function runOdoo(action) {
+    setOdooBusy(true);
+    setOdooResult(null);
+    try {
+      const r = await supa.callFn('odoo-sync', { action });
+      setOdooResult({ action, ...r });
+      if (action === 'sync') pollCloud();
+    } catch (e) {
+      setOdooResult({ action, error: (e && e.message) || 'failed' });
+    }
+    setOdooBusy(false);
   }
 
   // Customer returned the whole bill: remove every line and put the suits back into stock.
@@ -3457,6 +3484,11 @@ function AaraaPOS() {
                     : 'Rename "Suit …" names to "Fabrics …"'}
                 </button>
               )}
+              {!isStaff && cloud && (<>
+              <button type="button" disabled={odooBusy} onClick={() => runOdoo('test')} className="underline">Odoo: test</button>
+              <button type="button" disabled={odooBusy} onClick={() => runOdoo('preview')} className="underline">Odoo: preview</button>
+              <button type="button" disabled={odooBusy} onClick={() => runOdoo('sync')} className="underline font-semibold">{odooBusy ? 'Odoo: working…' : 'Odoo: sync stock'}</button>
+              </>)}
               {!isStaff && (<>
               <button type="button" onClick={exportData} className="underline">Export backup</button>
               <button type="button" onClick={copyBackupText} className="underline">Copy backup</button>
@@ -3467,6 +3499,23 @@ function AaraaPOS() {
               </label>
               </>)}
             </div>
+            {!isStaff && odooResult && (
+              <div className="mb-3 p-3 rounded-xl text-xs" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}`, color: COLORS.ink }}>
+                <div className="flex justify-between mb-1"><b>Odoo {odooResult.action}</b><button type="button" className="underline" onClick={() => setOdooResult(null)}>Close</button></div>
+                {odooResult.error ? (
+                  <div style={{ color: COLORS.rust }}>{odooResult.error}</div>
+                ) : odooResult.action === 'test' ? (
+                  <div>Connected. {odooResult.odooProductsWithBarcode} Odoo products have a barcode.{(odooResult.sample || []).map((x) => <div key={x.id}>{x.barcode} · {x.name} · qty {x.qty_available}</div>)}</div>
+                ) : (
+                  <div>
+                    {odooResult.dry ? 'Preview (nothing changed): ' : ''}matched {odooResult.matched} · Odoo updated {odooResult.pushedToOdoo} · POS updated {odooResult.pulledToPos} · unchanged {odooResult.unchanged} · unlimited skipped {odooResult.unlimited}
+                    {odooResult.missingInOdoo.length > 0 && <div className="mt-1"><b>Not in Odoo ({odooResult.missingInOdoo.length}):</b> {odooResult.missingInOdoo.slice(0, 15).join(', ')}{odooResult.missingInOdoo.length > 15 ? ' …' : ''}</div>}
+                    {odooResult.notTracked.length > 0 && <div className="mt-1"><b>Not tracking inventory in Odoo ({odooResult.notTracked.length}):</b> {odooResult.notTracked.slice(0, 15).join(', ')}</div>}
+                    {odooResult.errors.length > 0 && <div className="mt-1" style={{ color: COLORS.rust }}>{odooResult.errors.slice(0, 8).join(' | ')}</div>}
+                  </div>
+                )}
+              </div>
+            )}
             {!isStaff && backupMode && (
               <div className="mb-3 rounded-xl p-3" style={{ background: COLORS.card, border: `1px solid ${COLORS.border}` }}>
                 <div className="text-xs mb-2" style={{ color: COLORS.inkSoft }}>
