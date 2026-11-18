@@ -2271,10 +2271,19 @@ function AaraaPOS() {
     setOdooResult(null);
     try {
       const r = await supa.callFn('odoo-sync', { action });
-      setOdooResult({ action, ...r });
+      const L = (v) => (Array.isArray(v) ? v.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))) : []);
+      const N = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+      setOdooResult({
+        action,
+        dry: !!r.dry,
+        matched: N(r.matched), pushedToOdoo: N(r.pushedToOdoo), pulledToPos: N(r.pulledToPos), unchanged: N(r.unchanged), unlimited: N(r.unlimited),
+        missingInOdoo: L(r.missingInOdoo), notTracked: L(r.notTracked), errors: L(r.errors),
+        odooProductsWithBarcode: N(r.odooProductsWithBarcode),
+        sample: Array.isArray(r.sample) ? r.sample.map((x, i) => ({ id: i, barcode: String(x.barcode), name: String(x.name), qty_available: String(x.qty_available) })) : [],
+      });
       if (action === 'sync') pollCloud();
     } catch (e) {
-      setOdooResult({ action, error: (e && e.message) || 'failed' });
+      setOdooResult({ action, error: String((e && e.message) || 'failed') });
     }
     setOdooBusy(false);
   }
