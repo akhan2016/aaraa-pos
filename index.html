@@ -2266,6 +2266,27 @@ function AaraaPOS() {
     return true;
   }
 
+  async function runOdooPhotos() {
+    setOdooBusy(true);
+    setOdooResult(null);
+    const tot = { uploaded: 0, noPhoto: 0, notInOdoo: [], errors: [] };
+    try {
+      for (let i = 0; i < 100; i++) {
+        const r = await supa.callFn('odoo-sync', { action: 'photos' });
+        tot.uploaded += Number(r.uploaded) || 0;
+        tot.noPhoto += Number(r.noPhoto) || 0;
+        tot.notInOdoo.push(...(Array.isArray(r.notInOdoo) ? r.notInOdoo.map(String) : []));
+        tot.errors.push(...(Array.isArray(r.errors) ? r.errors.map(String) : []));
+        setToast(`Photos sent: ${tot.uploaded} · ${Number(r.remaining) || 0} left`);
+        if (!r.remaining) break;
+      }
+      setOdooResult({ action: 'photos', photoDone: true, ...tot });
+    } catch (e) {
+      setOdooResult({ action: 'photos', error: String((e && e.message) || 'failed') });
+    }
+    setOdooBusy(false);
+  }
+
   async function runOdoo(action) {
     setOdooBusy(true);
     setOdooResult(null);
@@ -3526,6 +3547,7 @@ function AaraaPOS() {
               <button type="button" onClick={exportOdooCsv} className="underline">Odoo: export file</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('test')} className="underline">Odoo: test</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('preview')} className="underline">Odoo: preview</button>
+              <button type="button" disabled={odooBusy} onClick={runOdooPhotos} className="underline">Odoo: send photos</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('sync')} className="underline font-semibold">{odooBusy ? 'Odoo: working…' : 'Odoo: sync stock'}</button>
               </>)}
               {!isStaff && (<>
@@ -3543,6 +3565,12 @@ function AaraaPOS() {
                 <div className="flex justify-between mb-1"><b>Odoo {odooResult.action}</b><button type="button" className="underline" onClick={() => setOdooResult(null)}>Close</button></div>
                 {odooResult.error ? (
                   <div style={{ color: COLORS.rust }}>{odooResult.error}</div>
+                ) : odooResult.photoDone ? (
+                  <div>
+                    Photos sent for {odooResult.uploaded} suits · no photo {odooResult.noPhoto}
+                    {odooResult.notInOdoo.length > 0 && <div className="mt-1"><b>Not in Odoo:</b> {odooResult.notInOdoo.slice(0, 15).join(', ')}</div>}
+                    {odooResult.errors.length > 0 && <div className="mt-1" style={{ color: COLORS.rust }}>{odooResult.errors.slice(0, 8).join(' | ')}</div>}
+                  </div>
                 ) : odooResult.action === 'test' ? (
                   <div>Connected. {odooResult.odooProductsWithBarcode} Odoo products have a barcode.{(odooResult.sample || []).map((x) => <div key={x.id}>{x.barcode} · {x.name} · qty {x.qty_available}</div>)}</div>
                 ) : (
