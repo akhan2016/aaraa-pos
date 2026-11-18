@@ -2279,6 +2279,7 @@ function AaraaPOS() {
         matched: N(r.matched), pushedToOdoo: N(r.pushedToOdoo), pulledToPos: N(r.pulledToPos), unchanged: N(r.unchanged), unlimited: N(r.unlimited),
         missingInOdoo: L(r.missingInOdoo), notTracked: L(r.notTracked), errors: L(r.errors),
         odooProductsWithBarcode: N(r.odooProductsWithBarcode),
+        diag: r.diag ? JSON.stringify(r.diag) : '',
         sample: Array.isArray(r.sample) ? r.sample.map((x, i) => ({ id: i, barcode: String(x.barcode), name: String(x.name), qty_available: String(x.qty_available) })) : [],
       });
       if (action === 'sync') pollCloud();
@@ -3518,6 +3519,7 @@ function AaraaPOS() {
                 ) : (
                   <div>
                     {odooResult.dry ? 'Preview (nothing changed): ' : ''}matched {odooResult.matched} · Odoo updated {odooResult.pushedToOdoo} · POS updated {odooResult.pulledToPos} · unchanged {odooResult.unchanged} · unlimited skipped {odooResult.unlimited}
+                    {odooResult.diag && <div className="mt-1" style={{ wordBreak: 'break-all' }}>{odooResult.diag}</div>}
                     {odooResult.missingInOdoo.length > 0 && <div className="mt-1"><b>Not in Odoo ({odooResult.missingInOdoo.length}):</b> {odooResult.missingInOdoo.slice(0, 15).join(', ')}{odooResult.missingInOdoo.length > 15 ? ' …' : ''}</div>}
                     {odooResult.notTracked.length > 0 && <div className="mt-1"><b>Not tracking inventory in Odoo ({odooResult.notTracked.length}):</b> {odooResult.notTracked.slice(0, 15).join(', ')}</div>}
                     {odooResult.errors.length > 0 && <div className="mt-1" style={{ color: COLORS.rust }}>{odooResult.errors.slice(0, 8).join(' | ')}</div>}
