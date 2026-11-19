@@ -2266,6 +2266,17 @@ function AaraaPOS() {
     return true;
   }
 
+  async function runOdooHsn() {
+    setOdooBusy(true);
+    try {
+      const r = await supa.callFn('odoo-sync', { action: 'hsn' });
+      setToast(`HSN 5810 set on ${Number(r.hsnProducts) || 0} products in Odoo`);
+    } catch (e) {
+      setOdooResult({ action: 'hsn', error: String((e && e.message) || 'failed') });
+    }
+    setOdooBusy(false);
+  }
+
   async function runOdooPos() {
     setOdooBusy(true);
     try {
@@ -3559,6 +3570,7 @@ function AaraaPOS() {
               <button type="button" onClick={exportOdooCsv} className="underline">Odoo: export file</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('test')} className="underline">Odoo: test</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('preview')} className="underline">Odoo: preview</button>
+              <button type="button" disabled={odooBusy} onClick={runOdooHsn} className="underline">Odoo: set HSN 5810</button>
               <button type="button" disabled={odooBusy} onClick={runOdooPos} className="underline">Odoo: add to POS</button>
               <button type="button" disabled={odooBusy} onClick={runOdooPhotos} className="underline">Odoo: send photos</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('sync')} className="underline font-semibold">{odooBusy ? 'Odoo: working…' : 'Odoo: sync stock'}</button>
