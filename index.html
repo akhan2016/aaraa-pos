@@ -2309,6 +2309,7 @@ function AaraaPOS() {
         action,
         dry: !!r.dry,
         matched: N(r.matched), pushedToOdoo: N(r.pushedToOdoo), pulledToPos: N(r.pulledToPos), unchanged: N(r.unchanged), unlimited: N(r.unlimited),
+        created: N(r.created),
         missingInOdoo: L(r.missingInOdoo), notTracked: L(r.notTracked), errors: L(r.errors),
         odooProductsWithBarcode: N(r.odooProductsWithBarcode),
         diag: r.diag ? JSON.stringify(r.diag) : '',
@@ -3587,7 +3588,7 @@ function AaraaPOS() {
                   <div>Connected. {odooResult.odooProductsWithBarcode} Odoo products have a barcode.{(odooResult.sample || []).map((x) => <div key={x.id}>{x.barcode} · {x.name} · qty {x.qty_available}</div>)}</div>
                 ) : (
                   <div>
-                    {odooResult.dry ? 'Preview (nothing changed): ' : ''}matched {odooResult.matched} · Odoo updated {odooResult.pushedToOdoo} · POS updated {odooResult.pulledToPos} · unchanged {odooResult.unchanged} · unlimited skipped {odooResult.unlimited}
+                    {odooResult.dry ? 'Preview (nothing changed): ' : ''}created {odooResult.created || 0} · matched {odooResult.matched} · Odoo updated {odooResult.pushedToOdoo} · POS updated {odooResult.pulledToPos} · unchanged {odooResult.unchanged} · unlimited skipped {odooResult.unlimited}
                     {odooResult.diag && <div className="mt-1" style={{ wordBreak: 'break-all' }}>{odooResult.diag}</div>}
                     {odooResult.missingInOdoo.length > 0 && <div className="mt-1"><b>Not in Odoo ({odooResult.missingInOdoo.length}):</b> {odooResult.missingInOdoo.slice(0, 15).join(', ')}{odooResult.missingInOdoo.length > 15 ? ' …' : ''}</div>}
                     {odooResult.notTracked.length > 0 && <div className="mt-1"><b>Not tracking inventory in Odoo ({odooResult.notTracked.length}):</b> {odooResult.notTracked.slice(0, 15).join(', ')}</div>}
