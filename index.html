@@ -2266,6 +2266,17 @@ function AaraaPOS() {
     return true;
   }
 
+  async function runOdooPublish() {
+    setOdooBusy(true);
+    try {
+      const r = await supa.callFn('odoo-sync', { action: 'publish' });
+      setToast(`${Number(r.published) || 0} in-stock suits are published on the Odoo website`);
+    } catch (e) {
+      setOdooResult({ action: 'publish', error: String((e && e.message) || 'failed') });
+    }
+    setOdooBusy(false);
+  }
+
   async function runOdooHsn() {
     setOdooBusy(true);
     try {
@@ -3570,6 +3581,7 @@ function AaraaPOS() {
               <button type="button" onClick={exportOdooCsv} className="underline">Odoo: export file</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('test')} className="underline">Odoo: test</button>
               <button type="button" disabled={odooBusy} onClick={() => runOdoo('preview')} className="underline">Odoo: preview</button>
+              <button type="button" disabled={odooBusy} onClick={runOdooPublish} className="underline">Odoo: publish in-stock</button>
               <button type="button" disabled={odooBusy} onClick={runOdooHsn} className="underline">Odoo: set HSN 5810</button>
               <button type="button" disabled={odooBusy} onClick={runOdooPos} className="underline">Odoo: add to POS</button>
               <button type="button" disabled={odooBusy} onClick={runOdooPhotos} className="underline">Odoo: send photos</button>
