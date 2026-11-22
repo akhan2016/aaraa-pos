@@ -2270,7 +2270,7 @@ function AaraaPOS() {
     setOdooBusy(true);
     try {
       const r = await supa.callFn('odoo-sync', { action: 'details' });
-      setToast(`Fabric details sent for ${Number(r.updated) || 0} suits${r.errors && r.errors.length ? ` · ${r.errors.length} errors` : ''}`);
+      setToast(`Fabric details sent for ${Number(r.updated) || 0} suits · ${Number(r.same) || 0} already up to date${r.left ? ` · ${r.left} left, tap again` : ''}${r.errors && r.errors.length ? ` · ${r.errors.length} errors` : ''}`);
       if (r.errors && r.errors.length) setOdooResult({ action: 'details', error: r.errors.join(' | ') });
     } catch (e) {
       setOdooResult({ action: 'details', error: String((e && e.message) || 'failed') });
